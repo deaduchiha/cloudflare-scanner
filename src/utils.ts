@@ -5,6 +5,8 @@ const MAX_DELAY_MS = 9999;
 const isTty = process.stdout.isTTY === true;
 export const cli = {
   green: (s: string) => (isTty ? `\x1b[32m${s}\x1b[0m` : s),
+  cyan: (s: string) => (isTty ? `\x1b[36m${s}\x1b[0m` : s),
+  yellow: (s: string) => (isTty ? `\x1b[33m${s}\x1b[0m` : s),
   dim: (s: string) => (isTty ? `\x1b[2m${s}\x1b[0m` : s),
   bold: (s: string) => (isTty ? `\x1b[1m${s}\x1b[0m` : s),
 };
@@ -96,41 +98,79 @@ export function exportCsv(data: CloudflareIPData[]): void {
   fs.writeFileSync(output, [header, ...rows].join("\n"), "utf-8");
 }
 
+const TABLE = {
+  tl: "┌",
+  tr: "┐",
+  bl: "└",
+  br: "┘",
+  h: "─",
+  v: "│",
+  cross: "┼",
+};
+
+function padCol(s: string, w: number): string {
+  return s.length >= w ? s.slice(0, w) : s + " ".repeat(w - s.length);
+}
+
 export function printResults(data: CloudflareIPData[]): void {
   if (noPrintResult()) return;
   if (data.length === 0) {
-    console.log(cli.dim("\nNo results."));
+    console.log("");
+    console.log(cli.dim("  No results."));
     return;
   }
   const n = Math.min(printNum, data.length);
-  const w = 16;
   const hasXray = data.some((d) => d.xrayLatencyMs !== undefined);
+  const ipW = 18;
+  const delayW = 10;
+  const speedW = 12;
+  const xrayW = hasXray ? 10 : 0;
+  const totalW = ipW + delayW + speedW + (hasXray ? xrayW + 3 : 2);
+
+  const sep = TABLE.h.repeat(ipW) + TABLE.cross + TABLE.h.repeat(delayW) + TABLE.cross + TABLE.h.repeat(speedW) + (hasXray ? TABLE.cross + TABLE.h.repeat(xrayW) : "");
+  const top = TABLE.tl + sep + TABLE.tr;
+  const mid = TABLE.v + TABLE.h.repeat(totalW) + TABLE.v;
+  const bot = TABLE.bl + sep + TABLE.br;
+
   console.log("");
   console.log(cli.bold("  Best IPs"));
+  console.log("  " + top);
+  const headerIp = padCol("IP", ipW);
+  const headerDelay = padCol("Delay (ms)", delayW);
+  const headerSpeed = padCol("Speed MB/s", speedW);
+  const headerXray = hasXray ? padCol("Xray (ms)", xrayW) : "";
   console.log(
-    cli.dim(
-      "  " +
-        "IP".padEnd(w) +
-        "Delay(ms)  " +
-        "Speed(MB/s)" +
-        (hasXray ? "  Xray(ms)" : "")
-    )
+    "  " +
+      TABLE.v +
+      cli.cyan(headerIp) +
+      TABLE.v +
+      cli.cyan(headerDelay) +
+      TABLE.v +
+      cli.cyan(headerSpeed) +
+      (hasXray ? TABLE.v + cli.cyan(headerXray) : "") +
+      TABLE.v
   );
+  console.log("  " + mid);
   for (let i = 0; i < n; i++) {
     const d = data[i];
     const speedMb = (d.downloadSpeed / 1024 / 1024).toFixed(2);
-    const xrayMs = d.xrayLatencyMs !== undefined ? d.xrayLatencyMs.toFixed(0) : "";
-    console.log(
-      "  " +
-        cli.green(d.ip.padEnd(w)) +
-        String(Math.round(d.delayMs)).padEnd(9) +
-        speedMb +
-        (hasXray ? "  " + xrayMs : "")
-    );
+    const xrayMs = d.xrayLatencyMs !== undefined ? String(Math.round(d.xrayLatencyMs)) : "";
+    const row =
+      TABLE.v +
+      cli.green(padCol(d.ip, ipW)) +
+      TABLE.v +
+      padCol(String(Math.round(d.delayMs)), delayW) +
+      TABLE.v +
+      padCol(speedMb, speedW) +
+      (hasXray ? TABLE.v + padCol(xrayMs, xrayW) : "") +
+      TABLE.v;
+    console.log("  " + row);
   }
+  console.log("  " + bot);
   if (!noOutput()) {
-    console.log(cli.dim(`  → ${output}`));
+    console.log(cli.dim(`  Saved: ${output}`));
   }
+  console.log("");
 }
 
 /** Simple progress: print every N items. */
@@ -153,14 +193,14 @@ export function createProgress(total: number, label: string): {
   };
 }
 
-const BAR_WIDTH = 20;
-const LINE_LEN = 72;
+const BAR_WIDTH = 24;
+const LINE_LEN = 78;
 
 function progressBar(current: number, total: number): string {
-  if (total <= 0) return "[" + " ".repeat(BAR_WIDTH) + "]";
+  if (total <= 0) return "▌" + "░".repeat(BAR_WIDTH) + "▐";
   const p = Math.min(1, current / total);
   const filled = Math.round(BAR_WIDTH * p);
-  return "[" + "=".repeat(filled) + " ".repeat(BAR_WIDTH - filled) + "]";
+  return "▌" + "█".repeat(filled) + "░".repeat(BAR_WIDTH - filled) + "▐";
 }
 
 /** Real-time progress: step, bar %, count, current IP. Success = green. */
@@ -221,6 +261,7 @@ export function createRealtimeProgress(
 export type OverallProgress = {
   grow: (n: number) => void;
   addTotal: (n: number) => void;
+  setLabel: (label: string) => void;
   done: () => void;
 };
 
@@ -228,6 +269,7 @@ export type OverallProgress = {
 export function createOverallProgress(label: string, total: number): OverallProgress {
   let current = 0;
   let totalCount = Math.max(0, total);
+  let phaseLabel = label;
   const pad = (s: string, len: number) =>
     s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
 
@@ -236,7 +278,8 @@ export function createOverallProgress(label: string, total: number): OverallProg
     const bar = progressBar(current, totalCount);
     const cnt = `${current}/${totalCount}`;
     const suffix = done ? ` ${cli.green("done")}` : "";
-    const line = pad(`${label} ${bar} ${pct}% ${cnt}${suffix}`, LINE_LEN);
+    const phase = cli.cyan(phaseLabel);
+    const line = pad(`${phase} ${bar} ${pct}% ${cnt}${suffix}`, LINE_LEN + 10);
     process.stdout.write(`\r${line}`);
   };
 
@@ -248,6 +291,10 @@ export function createOverallProgress(label: string, total: number): OverallProg
     },
     addTotal(n: number) {
       totalCount = Math.max(0, totalCount + n);
+      write();
+    },
+    setLabel(label: string) {
+      phaseLabel = label;
       write();
     },
     done() {

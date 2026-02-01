@@ -143,17 +143,16 @@ export async function testDownloadSpeed(
 ): Promise<CloudflareIPData[]> {
   if (disable) return ipSet;
   if (ipSet.length === 0) {
-    console.log(cli.dim("\nNo IPs from latency test, skipping download."));
+    console.log(cli.dim("\n  No IPs from latency test; skipping speed test."));
     return ipSet;
   }
   let testNum = Math.min(testCount, ipSet.length);
   if (minSpeed > 0) testNum = ipSet.length;
 
-  console.log(
-    cli.dim(`\n2/2 Speed test: top ${testNum} by latency (use -dn N for more)\n`)
-  );
-  const progress = bar || createOverallProgress("Scan", testNum);
+  if (!bar) console.log("");
+  const progress = bar || createOverallProgress("Speed", testNum);
   if (bar) {
+    progress.setLabel("Speed");
     progress.addTotal(testNum);
   }
   const speedSet: CloudflareIPData[] = [];

@@ -321,8 +321,10 @@ export async function testXrayForIps(
   if (ipSet.length === 0) return [];
   const maxCount =
     xrayMaxCount > 0 ? Math.min(xrayMaxCount, ipSet.length) : ipSet.length;
-  console.log(cli.dim(`\n3/3 Xray test: ${maxCount} IPs\n`));
-  if (bar) bar.addTotal(maxCount);
+  if (bar) {
+    bar.setLabel("Xray");
+    bar.addTotal(maxCount);
+  }
 
   const out: CloudflareIPData[] = [];
   for (let i = 0; i < maxCount; i++) {
@@ -335,7 +337,7 @@ export async function testXrayForIps(
     }
   }
   if (out.length === 0) {
-    console.log(cli.dim("No IPs passed the xray test."));
+    console.log(cli.dim("\n  No IPs passed the Xray proxy test."));
   }
   return out;
 }
