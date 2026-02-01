@@ -1,10 +1,11 @@
 import * as net from "net";
+import * as tls from "tls";
 import * as https from "https";
 import * as http from "http";
 import { URL } from "url";
 import { isIPv4Export } from "./ip";
 import type { CloudflareIPData } from "./types";
-import { createRealtimeProgress } from "./utils";
+import { createOverallProgress, OverallProgress } from "./utils";
 
 const TCP_CONNECT_TIMEOUT = 1000;
 
@@ -18,6 +19,7 @@ export let httpingCFColo = "";
 let httpingCFColomap: Set<string> | null = null;
 
 const COLO_REGEX = /[A-Z]{3}/;
+const TRACE_TIMEOUT_MS = 2500;
 
 export function setPingOptions(opts: {
   routines?: number;
@@ -74,6 +76,92 @@ function tcping(ip: string): Promise<{ ok: boolean; delayMs: number }> {
       sock.destroy();
       resolve({ ok: false, delayMs: 0 });
     });
+  });
+}
+
+function agentForIp(ip: string, hostname: string, port: number): https.Agent {
+  const opts = {
+    keepAlive: false,
+    createConnection: (
+      options: { port: number; host: string; timeout?: number },
+      callback: (err: Error | null, s?: net.Socket) => void
+    ) => {
+      const raw = net.connect(port, ip, () => {
+        const tlsSocket = tls.connect(
+          { socket: raw, servername: hostname, rejectUnauthorized: true },
+          () => callback(null, tlsSocket)
+        );
+        tlsSocket.on("error", (err) => callback(err));
+      });
+      raw.on("error", (err) => callback(err));
+      raw.setTimeout(options.timeout || TRACE_TIMEOUT_MS);
+    },
+  };
+  return new https.Agent(opts as https.AgentOptions);
+}
+
+function parseTraceBody(body: string): boolean {
+  if (!body) return false;
+  let hasColo = false;
+  let hasIp = false;
+  body.split(/\r?\n/).forEach((line) => {
+    if (line.startsWith("colo=")) hasColo = true;
+    if (line.startsWith("ip=")) hasIp = true;
+  });
+  return hasColo && hasIp;
+}
+
+function checkCdnTrace(ip: string): Promise<boolean> {
+  const u = new URL(url);
+  const isHttps = u.protocol === "https:";
+  const port = Number(u.port) || (isHttps ? 443 : 80);
+  const hostname = u.hostname;
+  const path = "/cdn-cgi/trace";
+
+  return new Promise((resolve) => {
+    const reqOptions: http.RequestOptions = {
+      host: ip,
+      port,
+      path,
+      method: "GET",
+      headers: {
+        Host: hostname,
+        "User-Agent": "CloudflareScanner/1",
+      },
+      timeout: TRACE_TIMEOUT_MS,
+    };
+
+    const doReq = isHttps
+      ? https.request({
+          ...reqOptions,
+          agent: agentForIp(ip, hostname, port),
+          rejectUnauthorized: true,
+          servername: hostname,
+        })
+      : http.request(reqOptions);
+
+    const req = doReq;
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on("response", (res) => {
+      if ((res.statusCode || 0) !== 200) {
+        res.destroy();
+        resolve(false);
+        return;
+      }
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        data += chunk;
+        if (data.length > 4096) res.destroy();
+      });
+      res.on("end", () => resolve(parseTraceBody(data)));
+      res.on("error", () => resolve(false));
+    });
+    req.end();
   });
 }
 
@@ -168,13 +256,12 @@ async function checkConnection(
   return { recv, totalDelayMs };
 }
 
-async function runOne(
-  ip: string,
-  bar: ReturnType<typeof createRealtimeProgress>
-): Promise<CloudflareIPData | null> {
+async function runOne(ip: string, bar: OverallProgress): Promise<CloudflareIPData | null> {
   const { recv, totalDelayMs } = await checkConnection(ip);
-  bar.grow(1, ip, recv > 0);
+  bar.grow(1);
   if (recv === 0) return null;
+  const traceOk = await checkCdnTrace(ip);
+  if (!traceOk) return null;
   return {
     ip,
     sent: pingTimes,
@@ -187,13 +274,9 @@ async function runOne(
 
 async function runBatch(
   ips: string[],
-  concurrency: number
+  concurrency: number,
+  bar: OverallProgress
 ): Promise<CloudflareIPData[]> {
-  const bar = createRealtimeProgress(
-    "Step 1/2: Latency test",
-    ips.length,
-    "Scanned"
-  );
   const results: CloudflareIPData[] = [];
   let next = 0;
   const workers = Array.from({ length: concurrency }, async (): Promise<void> => {
@@ -209,9 +292,14 @@ async function runBatch(
   return results;
 }
 
-export async function runPing(ips: string[]): Promise<CloudflareIPData[]> {
+export async function runPing(
+  ips: string[],
+  bar?: OverallProgress
+): Promise<CloudflareIPData[]> {
   if (ips.length === 0) return [];
   const concurrency = Math.min(routines, ips.length);
-  const results = await runBatch(ips, concurrency);
+  const progress = bar || createOverallProgress("Scan", ips.length);
+  const results = await runBatch(ips, concurrency, progress);
+  if (!bar) progress.done();
   return results;
 }

@@ -1,10 +1,11 @@
 import * as https from "https";
 import * as http from "http";
+import * as net from "net";
+import * as tls from "tls";
 import { URL } from "url";
 import type { CloudflareIPData } from "./types";
-import { createRealtimeProgress, cli } from "./utils";
+import { createOverallProgress, OverallProgress, cli } from "./utils";
 
-const BUFFER_SIZE = 1024;
 const DEFAULT_TIMEOUT_SEC = 10;
 
 export let url = "https://speed.cloudflare.com/__down?bytes=52428800";
@@ -29,6 +30,28 @@ export function setDownloadOptions(opts: {
 
 export let tcpPort = 443;
 
+/** Create HTTPS agent: connect to IP, TLS with SNI = hostname (required for Cloudflare). */
+function agentForIp(ip: string, hostname: string, port: number): https.Agent {
+  const opts = {
+    keepAlive: false,
+    createConnection: (
+      options: { port: number; host: string; timeout?: number },
+      callback: (err: Error | null, s?: net.Socket) => void
+    ) => {
+      const raw = net.connect(port, ip, () => {
+        const tlsSocket = tls.connect(
+          { socket: raw, servername: hostname, rejectUnauthorized: true },
+          () => callback(null, tlsSocket)
+        );
+        tlsSocket.on("error", (err) => callback(err));
+      });
+      raw.on("error", (err) => callback(err));
+      raw.setTimeout(options.timeout || timeoutSec * 1000);
+    },
+  };
+  return new https.Agent(opts as https.AgentOptions);
+}
+
 function downloadSpeed(ip: string): Promise<number> {
   return new Promise((resolve) => {
     const u = new URL(url);
@@ -38,6 +61,41 @@ function downloadSpeed(ip: string): Promise<number> {
     const path = u.pathname + u.search;
     const timeoutMs = timeoutSec * 1000;
 
+    if (!isHttps) {
+      const opts: http.RequestOptions = {
+        host: ip,
+        port,
+        path,
+        method: "GET",
+        headers: { Host: hostname, "User-Agent": "CloudflareScanner/1" },
+        timeout: timeoutMs,
+      };
+      const req = http.request(opts, (res) => {
+        if (res.statusCode !== 200) {
+          res.destroy();
+          resolve(0);
+          return;
+        }
+        let total = 0;
+        const start = Date.now();
+        res.on("data", (c: Buffer) => (total += c.length));
+        res.on("end", () => {
+          const elapsed = (Date.now() - start) / 1000;
+          resolve(elapsed > 0 ? total / elapsed : 0);
+        });
+        res.on("error", () => resolve(0));
+      });
+      req.on("error", () => resolve(0));
+      req.on("timeout", () => {
+        req.destroy();
+        resolve(0);
+      });
+      req.end();
+      return;
+    }
+
+    // HTTPS: connect to IP, TLS SNI = hostname
+    const agent = agentForIp(ip, hostname, port);
     const opts: https.RequestOptions = {
       host: ip,
       port,
@@ -45,16 +103,15 @@ function downloadSpeed(ip: string): Promise<number> {
       method: "GET",
       headers: {
         Host: hostname,
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (compatible; CloudflareScanner/1)",
       },
       timeout: timeoutMs,
+      agent,
       rejectUnauthorized: true,
-      // Required: connect to IP but TLS SNI must be the hostname so Cloudflare accepts the handshake
-      ...(isHttps && { servername: hostname }),
+      servername: hostname,
     };
 
-    const req = (isHttps ? https : http).request(opts, (res) => {
+    const req = https.request(opts, (res) => {
       if (res.statusCode !== 200) {
         res.destroy();
         resolve(0);
@@ -81,7 +138,8 @@ function downloadSpeed(ip: string): Promise<number> {
 }
 
 export async function testDownloadSpeed(
-  ipSet: CloudflareIPData[]
+  ipSet: CloudflareIPData[],
+  bar?: OverallProgress
 ): Promise<CloudflareIPData[]> {
   if (disable) return ipSet;
   if (ipSet.length === 0) {
@@ -91,29 +149,25 @@ export async function testDownloadSpeed(
   let testNum = Math.min(testCount, ipSet.length);
   if (minSpeed > 0) testNum = ipSet.length;
 
-  const minSpeedLabel =
-    minSpeed > 0 ? `${minSpeed.toFixed(2)} MB/s` : "none";
   console.log(
-    cli.dim(`\nDownload test: min speed ${minSpeedLabel}, testing ${testNum} IPs\n`)
+    cli.dim(`\n2/2 Speed test: top ${testNum} by latency (use -dn N for more)\n`)
   );
-  const bar = createRealtimeProgress(
-    "Step 2/2: Download speed",
-    testNum,
-    "Tested"
-  );
+  const progress = bar || createOverallProgress("Scan", testNum);
+  if (bar) {
+    progress.addTotal(testNum);
+  }
   const speedSet: CloudflareIPData[] = [];
   for (let i = 0; i < testNum; i++) {
-    bar.setCurrent(ipSet[i].ip);
     const speed = await downloadSpeed(ipSet[i].ip);
     ipSet[i].downloadSpeed = speed;
     const ok = speed >= minSpeed * 1024 * 1024;
-    bar.grow(1, ipSet[i].ip, ok);
+    progress.grow(1);
     if (ok) {
       speedSet.push(ipSet[i]);
       if (speedSet.length >= testCount) break;
     }
   }
-  bar.done();
+  if (!bar) progress.done();
   const result = speedSet.length > 0 ? speedSet : ipSet;
   return result;
 }

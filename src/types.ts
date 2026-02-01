@@ -8,4 +8,5 @@ export interface PingData {
 export interface CloudflareIPData extends PingData {
   lossRate: number;
   downloadSpeed: number; // bytes per second
+  xrayLatencyMs?: number;
 }

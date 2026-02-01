@@ -11,9 +11,11 @@ import {
   printResults,
   inputMaxLossRate,
   cli,
+  createOverallProgress,
 } from "./utils";
 import { setPingOptions, runPing } from "./ping";
 import { setDownloadOptions, testDownloadSpeed } from "./download";
+import { setXrayOptions, testXrayForIps } from "./xray";
 
 const VERSION = "2.2.5";
 
@@ -34,7 +36,21 @@ function parseArgs(): Record<string, string | number | boolean> {
       const key = a.replace(/^-+/, "").replace(/-/g, "");
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith("-")) {
-        if (["n", "t", "dn", "dt", "tp", "tl", "tll", "p", "httpingcode"].includes(key)) {
+        if (
+          [
+            "n",
+            "t",
+            "dn",
+            "dt",
+            "tp",
+            "tl",
+            "tll",
+            "p",
+            "httpingcode",
+            "xraytimeout",
+            "xrayn",
+          ].includes(key)
+        ) {
           args[key] = parseInt(next, 10) || 0;
         } else if (["tlr", "sl"].includes(key)) {
           args[key] = parseFloat(next) || 0;
@@ -79,6 +95,12 @@ Options:
 
   -dd          Disable download test (sort by latency only)
   -allip       Test all IPs in range (IPv4 only, default: one per /24)
+
+  -xray <file>    Xray config JSON for validation
+  -xraybin <path> Xray binary (default: xray)
+  -xrayurl <url>  Test URL via proxy (default: https://www.cloudflare.com/cdn-cgi/trace)
+  -xraytimeout 10 Timeout seconds for xray test (default 10)
+  -xrayn 0        Max IPs to test with xray (0 = all)
 
   -v           Print version
   -h           Print help
@@ -142,41 +164,44 @@ async function main(): Promise<void> {
     testCount: (args.dn as number) || 10,
     minSpeed: (args.sl as number) || 0,
   });
+  setXrayOptions({
+    configPath: (args.xray as string) || "",
+    bin: (args.xraybin as string) || "xray",
+    testUrl: (args.xrayurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
+    timeoutSec: (args.xraytimeout as number) || 10,
+    maxCount: (args.xrayn as number) || 0,
+  });
 
   if ((args.sl as number) > 0 && (args.tl as number) === 9999) {
     console.log("[Tip] When using [-sl], consider using [-tl] to avoid long testing...");
   }
 
-  const source = ipText ? "CLI (-ip)" : ipFile || "ip.txt";
-  console.log(cli.dim(`CloudflareScanner ${VERSION}  loading ${source}...`));
+  const source = ipText ? "CLI" : ipFile || "ip.txt";
+  console.log(cli.dim(`CloudflareScanner ${VERSION}  ${source}`));
   const ips = loadIPRanges();
   if (ips.length === 0) {
-    console.error("No IPs to test. Use -f <file> or -ip <ranges>.");
+    console.error("No IPs. Use -f <file> or -ip <ranges>.");
     process.exit(1);
   }
-  const rangeInfo =
-    lastLoadedRanges.length > 0
-      ? ` (${lastLoadedRanges.length} range${lastLoadedRanges.length === 1 ? "" : "s"})`
-      : "";
-  console.log(cli.dim(`${ips.length} IPs${rangeInfo}\n`));
+  const r = lastLoadedRanges.length;
+  console.log(cli.dim(`${ips.length} IPs${r ? ` (${r} ranges)` : ""}\n`));
 
-  const mode = args.httping ? "HTTP" : "TCP";
-  console.log(
-    cli.dim(
-      `Latency: ${mode} port ${(args.tp as number) || 443}  Delay: ${(args.tll as number) || 0}–${(args.tl as number) || 9999} ms  Max loss: ${inputMaxLossRate}\n`
-    )
-  );
+  console.log(cli.dim("1/3 Latency → 2/3 Speed → 3/3 Xray (if enabled)\n"));
 
-  let pingData = await runPing(ips);
+  const progress = createOverallProgress("Scan", ips.length);
+  let pingData = await runPing(ips, progress);
   pingData = sortByDelayAndLoss(pingData);
   pingData = filterDelay(pingData);
   pingData = filterLossRate(pingData);
 
-  let speedData = await testDownloadSpeed(pingData);
+  let speedData = await testDownloadSpeed(pingData, progress);
   speedData = sortBySpeed(speedData);
 
-  exportCsv(speedData);
-  printResults(speedData);
+  const finalData = await testXrayForIps(speedData, progress);
+  progress.done();
+
+  exportCsv(finalData);
+  printResults(finalData);
 
   const versionNew = await checkUpdate();
   if (versionNew) {

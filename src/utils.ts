@@ -69,54 +69,67 @@ export function sortBySpeed(data: CloudflareIPData[]): CloudflareIPData[] {
   return [...data].sort((a, b) => b.downloadSpeed - a.downloadSpeed);
 }
 
-function rowToString(d: CloudflareIPData): string[] {
+function rowToString(d: CloudflareIPData, includeXray: boolean): string[] {
   const loss = ((d.sent - d.received) / d.sent).toFixed(2);
   const speedMb = (d.downloadSpeed / 1024 / 1024).toFixed(2);
-  return [d.ip, String(d.sent), String(d.received), loss, d.delayMs.toFixed(2), speedMb];
+  const base = [
+    d.ip,
+    String(d.sent),
+    String(d.received),
+    loss,
+    d.delayMs.toFixed(2),
+    speedMb,
+  ];
+  if (!includeXray) return base;
+  const xray = d.xrayLatencyMs !== undefined ? d.xrayLatencyMs.toFixed(2) : "";
+  return [...base, xray];
 }
 
 export function exportCsv(data: CloudflareIPData[]): void {
   if (noOutput() || data.length === 0) return;
   const fs = require("fs");
-  const header = "IP Address,Sent,Received,Loss Rate,Average Delay,Download Speed (MB/s)";
-  const rows = data.map(rowToString).map((r) => r.join(","));
+  const hasXray = data.some((d) => d.xrayLatencyMs !== undefined);
+  const header = hasXray
+    ? "IP Address,Sent,Received,Loss Rate,Average Delay,Download Speed (MB/s),Xray Latency (ms)"
+    : "IP Address,Sent,Received,Loss Rate,Average Delay,Download Speed (MB/s)";
+  const rows = data.map((d) => rowToString(d, hasXray)).map((r) => r.join(","));
   fs.writeFileSync(output, [header, ...rows].join("\n"), "utf-8");
 }
 
 export function printResults(data: CloudflareIPData[]): void {
   if (noPrintResult()) return;
   if (data.length === 0) {
-    console.log(cli.dim("\nNo results to show."));
+    console.log(cli.dim("\nNo results."));
     return;
   }
   const n = Math.min(printNum, data.length);
-  const hasLongIp = data.some((d) => d.ip.length > 15);
-  const w = hasLongIp ? 42 : 17;
+  const w = 16;
+  const hasXray = data.some((d) => d.xrayLatencyMs !== undefined);
   console.log("");
-  console.log(cli.bold("  Best IPs (latency + speed):"));
+  console.log(cli.bold("  Best IPs"));
   console.log(
     cli.dim(
       "  " +
-        "IP Address".padEnd(w) +
-        "Sent  Recv  Loss   Delay(ms)  Speed(MB/s)"
+        "IP".padEnd(w) +
+        "Delay(ms)  " +
+        "Speed(MB/s)" +
+        (hasXray ? "  Xray(ms)" : "")
     )
   );
   for (let i = 0; i < n; i++) {
     const d = data[i];
-    const loss = ((d.sent - d.received) / d.sent).toFixed(2);
     const speedMb = (d.downloadSpeed / 1024 / 1024).toFixed(2);
+    const xrayMs = d.xrayLatencyMs !== undefined ? d.xrayLatencyMs.toFixed(0) : "";
     console.log(
       "  " +
         cli.green(d.ip.padEnd(w)) +
-        String(d.sent).padEnd(5) +
-        String(d.received).padEnd(6) +
-        loss.padEnd(7) +
-        d.delayMs.toFixed(0).padEnd(10) +
-        speedMb
+        String(Math.round(d.delayMs)).padEnd(9) +
+        speedMb +
+        (hasXray ? "  " + xrayMs : "")
     );
   }
   if (!noOutput()) {
-    console.log(cli.dim(`\n  Results saved to ${output}`));
+    console.log(cli.dim(`  → ${output}`));
   }
 }
 
@@ -140,9 +153,17 @@ export function createProgress(total: number, label: string): {
   };
 }
 
-const PROGRESS_LINE_LENGTH = 100;
+const BAR_WIDTH = 20;
+const LINE_LEN = 72;
 
-/** Real-time progress: step, count, current IP. Successful IPs shown in green. */
+function progressBar(current: number, total: number): string {
+  if (total <= 0) return "[" + " ".repeat(BAR_WIDTH) + "]";
+  const p = Math.min(1, current / total);
+  const filled = Math.round(BAR_WIDTH * p);
+  return "[" + "=".repeat(filled) + " ".repeat(BAR_WIDTH - filled) + "]";
+}
+
+/** Real-time progress: step, bar %, count, current IP. Success = green. */
 export function createRealtimeProgress(
   stepLabel: string,
   total: number,
@@ -159,13 +180,18 @@ export function createRealtimeProgress(
     s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
 
   const write = () => {
-    const part = cli.dim(`${stepLabel}  ${countLabel}: ${current}/${total}`);
-    const ipDisplay = lastIp
+    const pct = total > 0 ? Math.round((100 * current) / total) : 0;
+    const bar = progressBar(current, total);
+    const cnt = `${current}/${total}`;
+    const ipPart = lastIp
       ? lastSuccess
-        ? `  ${cli.green(lastIp)}`
-        : `  ${lastIp}`
+        ? ` ${cli.green(lastIp)}`
+        : ` ${lastIp}`
       : "";
-    const line = pad(part + ipDisplay, PROGRESS_LINE_LENGTH);
+    const line = pad(
+      `${stepLabel} ${bar} ${pct}% ${cnt}${ipPart}`,
+      LINE_LEN
+    );
     process.stdout.write(`\r${line}`);
   };
 
@@ -182,11 +208,52 @@ export function createRealtimeProgress(
     },
     done() {
       lastIp = "";
+      const pct = total > 0 ? Math.round((100 * current) / total) : 100;
       const line = pad(
-        `${stepLabel}  ${countLabel}: ${current}/${total} ${cli.green("✓")}`,
-        PROGRESS_LINE_LENGTH
+        `${stepLabel} ${progressBar(current, total)} ${pct}% ${cli.green("done")}`,
+        LINE_LEN
       );
       process.stdout.write(`\r${line}\n`);
+    },
+  };
+}
+
+export type OverallProgress = {
+  grow: (n: number) => void;
+  addTotal: (n: number) => void;
+  done: () => void;
+};
+
+/** Overall progress for the whole scan (no per-IP display). */
+export function createOverallProgress(label: string, total: number): OverallProgress {
+  let current = 0;
+  let totalCount = Math.max(0, total);
+  const pad = (s: string, len: number) =>
+    s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
+
+  const write = (done = false) => {
+    const pct = totalCount > 0 ? Math.round((100 * current) / totalCount) : 0;
+    const bar = progressBar(current, totalCount);
+    const cnt = `${current}/${totalCount}`;
+    const suffix = done ? ` ${cli.green("done")}` : "";
+    const line = pad(`${label} ${bar} ${pct}% ${cnt}${suffix}`, LINE_LEN);
+    process.stdout.write(`\r${line}`);
+  };
+
+  return {
+    grow(n: number) {
+      current += n;
+      if (current > totalCount) current = totalCount;
+      write();
+    },
+    addTotal(n: number) {
+      totalCount = Math.max(0, totalCount + n);
+      write();
+    },
+    done() {
+      current = totalCount;
+      write(true);
+      process.stdout.write("\n");
     },
   };
 }
