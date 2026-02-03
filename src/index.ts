@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 
-import { setIPOptions, loadIPRanges, ipFile, ipText, lastLoadedRanges } from "./ip";
+import {
+  setIPOptions,
+  loadIPRanges,
+  ipFile,
+  ipText,
+  lastLoadedRanges,
+} from "./ip";
 import {
   setUtilsOptions,
   filterDelay,
@@ -18,7 +24,10 @@ import { setDownloadOptions, testDownloadSpeed } from "./download";
 import { setXrayOptions, testXrayForIps } from "./xray";
 import { ipToCidr24 } from "./ip";
 import { fetchCloudflareRanges, formatRangesForFile } from "./fetch";
+import { probeRanges } from "./probe";
+import { parseRangesFromContent, loadIPsFromRanges } from "./ip";
 import * as fs from "fs";
+import * as path from "path";
 
 const VERSION = "1.0.0";
 
@@ -45,11 +54,29 @@ function parseArgs(): Record<string, string | number | boolean> {
   const args: Record<string, string | number | boolean> = {};
   const argv = process.argv.slice(2);
   const numericKeys = [
-    "n", "t", "dn", "dt", "tp", "tl", "tll", "p",
-    "httpingcode", "xraytimeout", "xrayn",
+    "n",
+    "t",
+    "dn",
+    "dt",
+    "tp",
+    "tl",
+    "tll",
+    "p",
+    "httpingcode",
+    "xraytimeout",
+    "xrayn",
   ];
   const floatKeys = ["tlr", "sl"];
-  const flagKeys = ["httping", "dd", "allip", "skiptrace", "discover", "fetch", "extended"];
+  const flagKeys = [
+    "httping",
+    "dd",
+    "allip",
+    "skiptrace",
+    "discover",
+    "fetch",
+    "extended",
+    "probe",
+  ];
 
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -122,6 +149,7 @@ const HELP = `
     -seed <ip>            Scan /24 around working IP (e.g. 135.84.76.19)
     -fetch                Fetch valid Cloudflare IP ranges → ip.txt
     -extended             With -fetch: include 135.84.x.x (Xray working)
+    -probe                Check which ranges are unblocked (for Iran etc.) before scan/fetch
     -discover             Find working ranges from scan → write /24 blocks to -dr file
     -dr, --discover-ranges <path>  Output working ranges (default: working-ranges.txt)
     -o, --output <path>   CSV output (default: result.csv, "" = none)
@@ -132,7 +160,7 @@ const HELP = `
     -xray <path>          Config JSON; validates IPs via proxy (only these work!)
     -xraybin <path>       Xray binary (default: xray)
     -xrayurl <url>        URL to test via proxy
-    -xraytimeout <sec>    Timeout per IP (default: 10)
+    -xraytimeout <sec>    Timeout per IP (default: 5)
     -xrayn <N>            Max IPs to test (0 = all)
 
   MISC
@@ -170,15 +198,33 @@ async function main(): Promise<void> {
   if (args.fetch) {
     const outPath = (args.f as string) || "ip.txt";
     const includeExtended = !!args.extended;
+    const doProbe = !!args.probe;
+    const tcpPort = (args.tp as number) || 443;
     console.log("");
     console.log(cli.bold("  Fetching valid Cloudflare IP ranges..."));
     try {
       const { ipv4, ipv6 } = await fetchCloudflareRanges();
-      const content = formatRangesForFile(ipv4, ipv6, includeExtended);
+      let ranges = [...ipv4, ...ipv6];
+      if (includeExtended) ranges.push("135.84.0.0/16");
+
+      if (doProbe) {
+        console.log(cli.cyan("  Probing ranges (checking which are unblocked)..."));
+        ranges = await probeRanges(ranges, tcpPort, (cur, tot, cidr, ok) => {
+          const status = ok ? cli.green("✓") : cli.dim("✗");
+          process.stdout.write(`\r  ${cur}/${tot} ${status} ${cidr}    `);
+        });
+        process.stdout.write("\r" + " ".repeat(60) + "\r");
+        console.log(cli.green(`  Unblocked: ${ranges.length} ranges`));
+      }
+
+      const content = [
+        "# Cloudflare IP ranges" + (doProbe ? " (unblocked)" : ""),
+        "# " + new Date().toISOString().slice(0, 10),
+        "",
+        ...ranges,
+      ].join("\n") + "\n";
       fs.writeFileSync(outPath, content, "utf-8");
       console.log(cli.green(`  Saved: ${outPath}`));
-      console.log(cli.dim(`  IPv4: ${ipv4.length} ranges, IPv6: ${ipv6.length} ranges`));
-      if (includeExtended) console.log(cli.dim("  + extended (135.84.0.0/16 for Xray)"));
       console.log("");
     } catch (err) {
       console.error(cli.yellow("  Fetch failed:"), err);
@@ -205,7 +251,8 @@ async function main(): Promise<void> {
     pingTimes: (args.t as number) || 1,
     tcpPort: (args.tp as number) || 443,
     url: (args.url as string) || "https://speed.cloudflare.com/__down",
-    traceUrl: (args.traceurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
+    traceUrl:
+      (args.traceurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
     skipTrace: !!args.skiptrace,
     httping: !!args.httping,
     httpingStatusCode: (args.httpingcode as number) || 0,
@@ -222,13 +269,55 @@ async function main(): Promise<void> {
   setXrayOptions({
     configPath: xrayPath || "",
     bin: (args.xraybin as string) || "xray",
-    testUrl: (args.xrayurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
-    timeoutSec: (args.xraytimeout as number) || 10,
+    testUrl:
+      (args.xrayurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
+    timeoutSec: (args.xraytimeout as number) || 5,
     maxCount: (args.xrayn as number) ?? (xrayPath ? 50 : 0),
   });
 
-  const source = (args.ip as string) ? "CLI" : (args.seed as string) ? "seed" : ipFile || "ip.txt";
-  const ips = loadIPRanges();
+  const source = (args.ip as string)
+    ? "CLI"
+    : (args.seed as string)
+    ? "seed"
+    : ipFile || "ip.txt";
+
+  let ips: string[];
+  const doProbe = !!args.probe;
+  const tcpPort = (args.tp as number) || 443;
+
+  if (doProbe && !(args.ip as string)) {
+    let cidrs: string[] = [];
+    const seed = (args.seed as string) || "";
+    if (seed) {
+      const cidr24 = ipToCidr24(seed.trim());
+      if (cidr24) cidrs.push(cidr24);
+    }
+    const filePath = path.resolve(ipFile || "ip.txt");
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, "utf-8");
+      cidrs = [...cidrs, ...parseRangesFromContent(content)];
+    }
+    if (cidrs.length === 0) {
+      console.error(cli.dim("No valid ranges in file."));
+      process.exit(1);
+    }
+    console.log("");
+    console.log(cli.cyan("  Probing ranges (checking which are unblocked)..."));
+    const unblocked = await probeRanges(cidrs, tcpPort, (cur, tot, cidr, ok) => {
+      const status = ok ? cli.green("✓") : cli.dim("✗");
+      process.stdout.write(`\r  ${cur}/${tot} ${status} ${cidr}    `);
+    });
+    process.stdout.write("\r" + " ".repeat(70) + "\r");
+    console.log(cli.green(`  Unblocked: ${unblocked.length}/${cidrs.length} ranges`));
+    if (unblocked.length === 0) {
+      console.error(cli.yellow("  All ranges blocked. Try -fetch -probe -extended to get fresh ranges."));
+      process.exit(1);
+    }
+    ips = loadIPsFromRanges(unblocked);
+  } else {
+    ips = loadIPRanges();
+  }
+
   if (ips.length === 0) {
     console.error(cli.dim("No IPs. Use -f <file> or -ip <ranges>."));
     process.exit(1);
@@ -236,13 +325,21 @@ async function main(): Promise<void> {
   const r = lastLoadedRanges.length;
 
   console.log("");
-  console.log(cli.bold("  CloudflareScanner " + VERSION) + cli.dim(`  · ${source}`));
+  console.log(
+    cli.bold("  CloudflareScanner " + VERSION) + cli.dim(`  · ${source}`)
+  );
   console.log(cli.dim(`  IPs: ${ips.length}${r ? ` (${r} ranges)` : ""}`));
   if (xrayPath) {
-    console.log(cli.cyan("  Xray: validating via proxy - only working Address will be output"));
+    console.log(
+      cli.cyan(
+        "  Xray: validating via proxy - only working Address will be output"
+      )
+    );
   }
   if ((args.sl as number) > 0 && (args.tl as number) === 9999) {
-    console.log(cli.yellow("  Tip: use -tl to cap latency and speed up when using -sl"));
+    console.log(
+      cli.yellow("  Tip: use -tl to cap latency and speed up when using -sl")
+    );
   }
   console.log("");
 
@@ -258,15 +355,17 @@ async function main(): Promise<void> {
 
   const hasRealSpeed = speedData.some((d) => d.downloadSpeed > 0);
   if (!hasRealSpeed && speedData.length > 0 && !args.dd) {
-    console.log(cli.yellow("  Note: Speed test returned 0 for all IPs. Use -dd to skip speed test."));
+    console.log(
+      cli.yellow(
+        "  Note: Speed test returned 0 for all IPs. Use -dd to skip speed test."
+      )
+    );
   }
   const finalData = hasRealSpeed
     ? speedData.filter((d) => d.downloadSpeed > 0)
     : speedData;
 
-  const xrayInput = useXray
-    ? pingData.slice(0, 50)
-    : finalData;
+  const xrayInput = useXray ? pingData.slice(0, 50) : finalData;
   const outputData = await testXrayForIps(xrayInput, progress);
   progress.done();
 
@@ -274,7 +373,8 @@ async function main(): Promise<void> {
   printResults(outputData);
 
   if (args.discover) {
-    const workingIps = outputData.length > 0 ? outputData : pingData.slice(0, 100);
+    const workingIps =
+      outputData.length > 0 ? outputData : pingData.slice(0, 100);
     const ranges = new Set<string>();
     for (const d of workingIps) {
       const cidr = ipToCidr24(d.ip);
@@ -282,14 +382,17 @@ async function main(): Promise<void> {
     }
     const rangeList = [...ranges].sort();
     const drPath = (args.dr as string) || "working-ranges.txt";
-    const header = [
-      "# Working IP ranges (discovered from scan)",
-      "# Add these to ip.txt for better results",
-      "",
-      ...rangeList,
-    ].join("\n") + "\n";
+    const header =
+      [
+        "# Working IP ranges (discovered from scan)",
+        "# Add these to ip.txt for better results",
+        "",
+        ...rangeList,
+      ].join("\n") + "\n";
     fs.writeFileSync(drPath, header, "utf-8");
-    console.log(cli.green(`  Discovered ${rangeList.length} working ranges → ${drPath}`));
+    console.log(
+      cli.green(`  Discovered ${rangeList.length} working ranges → ${drPath}`)
+    );
     console.log(cli.dim("  Add these to ip.txt for future scans"));
     console.log("");
   }

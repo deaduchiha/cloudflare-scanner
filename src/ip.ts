@@ -152,3 +152,26 @@ export function loadIPRanges(): string[] {
   }
   return ips;
 }
+
+/** Parse CIDR lines from file content (no IP expansion). */
+export function parseRangesFromContent(content: string): string[] {
+  const cidrs: string[] = [];
+  content.split(/\r?\n/).forEach((line) => {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) return;
+    const fixed = fixIP(t);
+    if (IpCidr.isValidCIDR(fixed)) cidrs.push(fixed);
+  });
+  return cidrs;
+}
+
+/** Load IPs from a list of CIDR ranges (used after probe filter). */
+export function loadIPsFromRanges(cidrs: string[]): string[] {
+  const ips: string[] = [];
+  lastLoadedRanges = [];
+  for (const cidr of cidrs) {
+    lastLoadedRanges.push(cidr);
+    parseCIDR(cidr).forEach((ip) => ips.push(ip));
+  }
+  return ips;
+}

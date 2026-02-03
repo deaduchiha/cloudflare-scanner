@@ -42,6 +42,20 @@ node dist/index.js -f ip.txt -xray config.json -discover
 # Add working-ranges.txt to ip.txt for better results next time
 ```
 
+### 2b. For Iran / restricted regions (ranges get blocked daily)
+
+Use `-probe` to check which ranges are **unblocked** before scanning:
+
+```bash
+# Fetch + probe: get ranges, test each, save only unblocked to ip.txt
+node dist/index.js -fetch -extended -probe -f ip.txt
+
+# Scan + probe: test ranges in ip.txt, scan only unblocked ones
+node dist/index.js -f ip.txt -probe -xray config.json -o result.csv
+```
+
+This skips blocked ranges so you only search for clean IPs in ranges that work on your network.
+
 ### 3. How to scan IP ranges
 
 **Option A — From a file (default: `ip.txt`)**
@@ -130,6 +144,7 @@ The table shows: **IP**, **Sent/Received**, **Loss rate**, **Average delay (ms)*
 |--------|-------------|
 | `-fetch` | Fetch Cloudflare IP ranges from cloudflare.com → ip.txt |
 | `-extended` | With -fetch: add 135.84.0.0/16 (Xray working) |
+| `-probe` | Test which ranges are unblocked (for Iran etc.) before fetch/scan |
 | `-f, -file` | IP list file (default: ip.txt) |
 | `-ip` | IP ranges from CLI, e.g. 104.16.0.0/13,172.64.0.0/13 |
 | `-seed` | Scan /24 around a working IP (e.g. 135.84.76.19) |

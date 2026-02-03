@@ -164,10 +164,7 @@ export async function testDownloadSpeed(
 
   if (!bar) console.log("");
   const progress = bar || createOverallProgress("Speed", testNum);
-  if (bar) {
-    progress.setLabel("Speed");
-    progress.addTotal(testNum);
-  }
+  if (bar) progress.reset("Speed", testNum);
 
   const results: CloudflareIPData[] = [];
   const toTest = ipSet.slice(0, testNum);

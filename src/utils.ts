@@ -262,6 +262,7 @@ export type OverallProgress = {
   grow: (n: number) => void;
   addTotal: (n: number) => void;
   setLabel: (label: string) => void;
+  reset: (label: string, total: number) => void;
   done: () => void;
 };
 
@@ -295,6 +296,12 @@ export function createOverallProgress(label: string, total: number): OverallProg
     },
     setLabel(label: string) {
       phaseLabel = label;
+      write();
+    },
+    reset(label: string, total: number) {
+      phaseLabel = label;
+      current = 0;
+      totalCount = Math.max(0, total);
       write();
     },
     done() {

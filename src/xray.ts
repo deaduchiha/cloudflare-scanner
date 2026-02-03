@@ -11,7 +11,7 @@ import { cli, OverallProgress } from "./utils";
 export let xrayConfigPath = "";
 export let xrayBin = "xray";
 export let xrayTestUrl = "https://www.cloudflare.com/cdn-cgi/trace";
-export let xrayTimeoutSec = 10;
+export let xrayTimeoutSec = 5;
 export let xrayMaxCount = 0;
 
 export function setXrayOptions(opts: {
@@ -37,6 +37,19 @@ type ProxyInbound = {
 function readConfigTemplate(): Record<string, unknown> {
   const raw = fs.readFileSync(xrayConfigPath, "utf-8");
   return JSON.parse(raw) as Record<string, unknown>;
+}
+
+function applyPortInConfig(config: Record<string, unknown>, port: number): void {
+  const inbounds = config.inbounds;
+  if (!Array.isArray(inbounds)) return;
+  for (const inbound of inbounds) {
+    if (!inbound || typeof inbound !== "object") continue;
+    const protocol = (inbound as { protocol?: string }).protocol;
+    if (protocol === "socks" || protocol === "http") {
+      (inbound as { port: number }).port = port;
+      return;
+    }
+  }
 }
 
 function applyAddressInConfig(config: Record<string, unknown>, ip: string): void {
@@ -112,7 +125,7 @@ function waitForPort(host: string, port: number, timeoutMs: number): Promise<boo
         resolve(true);
       });
       s.on("error", () => resolve(false));
-      s.setTimeout(500, () => {
+      s.setTimeout(300, () => {
         s.destroy();
         resolve(false);
       });
@@ -122,7 +135,7 @@ function waitForPort(host: string, port: number, timeoutMs: number): Promise<boo
     for (;;) {
       if (await tryOnce()) return resolve(true);
       if (Date.now() - start > timeoutMs) return resolve(false);
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, 50));
     }
   });
 }
@@ -285,9 +298,10 @@ async function requestThroughProxy(
   });
 }
 
-async function runXrayForIp(ip: string): Promise<number> {
+async function runXrayForIp(ip: string, portOverride?: number): Promise<number> {
   const template = readConfigTemplate();
   applyAddressInConfig(template, ip);
+  if (portOverride !== undefined) applyPortInConfig(template, portOverride);
   const inbound = getProxyInbound(template);
   const tmpPath = path.join(
     os.tmpdir(),
@@ -321,19 +335,26 @@ export async function testXrayForIps(
   if (ipSet.length === 0) return [];
   const maxCount =
     xrayMaxCount > 0 ? Math.min(xrayMaxCount, ipSet.length) : ipSet.length;
-  if (bar) {
-    bar.setLabel("Xray");
-    bar.addTotal(maxCount);
-  }
+  if (bar) bar.reset("Xray", maxCount);
 
+  const template = readConfigTemplate();
+  const basePort = getProxyInbound(template).port;
+  const PARALLEL = 3;
   const out: CloudflareIPData[] = [];
-  for (let i = 0; i < maxCount; i++) {
-    const ip = ipSet[i].ip;
-    const latency = await runXrayForIp(ip);
-    if (bar) bar.grow(1);
-    if (latency > 0) {
-      ipSet[i].xrayLatencyMs = latency;
-      out.push(ipSet[i]);
+
+  for (let i = 0; i < maxCount; i += PARALLEL) {
+    const batch = ipSet.slice(i, i + PARALLEL);
+    const results = await Promise.all(
+      batch.map((d, idx) =>
+        runXrayForIp(d.ip, basePort + idx).then((lat) => ({ data: d, lat }))
+      )
+    );
+    for (const r of results) {
+      if (bar) bar.grow(1);
+      if (r.lat > 0) {
+        r.data.xrayLatencyMs = r.lat;
+        out.push(r.data);
+      }
     }
   }
   if (out.length === 0) {
