@@ -23,12 +23,10 @@ import { cli } from "./utils";
 // ═══════════════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-  // Scanning
-  CONCURRENCY: 100, // High concurrency for speed
-  SAMPLES_PER_RANGE: 3, // IPs to test per subnet
-  TIMEOUT_MS: 6000, // Connection timeout (slower networks)
-  MIN_SUCCESS_RATE: 0.5, // 50% must pass
-  MAX_AVG_LATENCY: 3000, // Max acceptable latency (ms)
+  // Scanning - optimized for speed
+  CONCURRENCY: 500, // High concurrency (500 parallel connections)
+  TIMEOUT_MS: 3000, // 3 second timeout (faster fail)
+  MAX_LATENCY: 2500, // Max acceptable latency (ms)
 
   // Input/Output
   INPUT_FILE: "subnets.txt",
@@ -540,29 +538,41 @@ interface ScanResult {
 
 let PROBE_CONFIG: ProbeConfig;
 
-async function scanSubnet(cidr: string): Promise<ScanResult> {
-  const ips = getRandomIps(cidr, CONFIG.SAMPLES_PER_RANGE);
-  if (ips.length === 0) {
+/**
+ * FAST scan: test 1 random IP from subnet.
+ * If it responds, subnet is clean. No need to test multiple IPs.
+ */
+async function scanSubnetFast(cidr: string): Promise<ScanResult> {
+  const ip = getRandomIps(cidr, 1)[0];
+  if (!ip) {
     return { cidr, successRate: 0, avgLatency: 0, passed: false };
   }
 
-  const results = await Promise.all(
-    ips.map((ip) => checkProbe(ip, PROBE_CONFIG))
-  );
-  const successes = results.filter((r) => r.ok);
-  const successRate = successes.length / results.length;
-
-  if (successes.length === 0) {
-    return { cidr, successRate: 0, avgLatency: 0, passed: false };
+  const result = await checkProbe(ip, PROBE_CONFIG);
+  if (result.ok && result.latencyMs <= CONFIG.MAX_LATENCY) {
+    return {
+      cidr,
+      successRate: 1,
+      avgLatency: result.latencyMs,
+      passed: true,
+    };
   }
 
-  const avgLatency =
-    successes.reduce((sum, r) => sum + r.latencyMs, 0) / successes.length;
-  const passed =
-    successRate >= CONFIG.MIN_SUCCESS_RATE &&
-    avgLatency <= CONFIG.MAX_AVG_LATENCY;
+  // First IP failed - try one more random IP (second chance)
+  const ip2 = getRandomIps(cidr, 1)[0];
+  if (ip2 && ip2 !== ip) {
+    const result2 = await checkProbe(ip2, PROBE_CONFIG);
+    if (result2.ok && result2.latencyMs <= CONFIG.MAX_LATENCY) {
+      return {
+        cidr,
+        successRate: 0.5,
+        avgLatency: result2.latencyMs,
+        passed: true,
+      };
+    }
+  }
 
-  return { cidr, successRate, avgLatency, passed };
+  return { cidr, successRate: 0, avgLatency: 0, passed: false };
 }
 
 async function scanAllSubnets(
@@ -583,7 +593,7 @@ async function scanAllSubnets(
     while (index < subnets.length) {
       const i = index++;
       const cidr = subnets[i];
-      const result = await scanSubnet(cidr);
+      const result = await scanSubnetFast(cidr);
       results.push(result);
       done++;
       if (result.passed) onClean?.(result);
@@ -839,18 +849,26 @@ async function main(): Promise<void> {
 
   const startScan = Date.now();
   let passedCount = 0;
+  let lastUpdate = 0;
 
   const scanResults = await scanAllSubnets(
     uniqueSubnets,
-    (done, total, current, passed) => {
+    (done, total, _current, passed) => {
       if (passed) passedCount++;
-      const bar = progressBar(done, total);
-      const status = passed ? cli.green("✓") : cli.dim("✗");
-      process.stdout.write(
-        `\r  ${bar} ${done}/${total} ${status} ${cli.green(
-          passedCount.toString()
-        )} clean    `
-      );
+      const now = Date.now();
+      const elapsed = (now - startScan) / 1000 || 0.001;
+      const speed = done / elapsed;
+      const eta = speed > 0 ? Math.round((total - done) / speed) : 0;
+      // Update at most every 100ms to reduce flickering
+      if (now - lastUpdate > 100 || done === total) {
+        lastUpdate = now;
+        const bar = progressBar(done, total);
+        process.stdout.write(
+          `\r  ${bar} ${done}/${total} ${cli.green(
+            passedCount.toString()
+          )} clean | ${speed.toFixed(0)}/s | ETA ${eta}s    `
+        );
+      }
     },
     (result) => {
       // Append immediately when subnet passes
