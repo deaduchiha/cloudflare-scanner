@@ -76,6 +76,7 @@ function parseArgs(): Record<string, string | number | boolean> {
     "fetch",
     "extended",
     "probe",
+    "rangesonly",
   ];
 
   for (let i = 0; i < argv.length; i++) {
@@ -150,6 +151,7 @@ const HELP = `
     -fetch                Fetch valid Cloudflare IP ranges → ip.txt
     -extended             With -fetch: include 135.84.x.x (Xray working)
     -probe                Check which ranges are unblocked (for Iran etc.) before scan/fetch
+    -rangesonly           With -fetch -probe: output working RANGES only (no IP scan)
     -discover             Find working ranges from scan → write /24 blocks to -dr file
     -dr, --discover-ranges <path>  Output working ranges (default: working-ranges.txt)
     -o, --output <path>   CSV output (default: result.csv, "" = none)
@@ -213,18 +215,61 @@ async function main(): Promise<void> {
           const status = ok ? cli.green("✓") : cli.dim("✗");
           process.stdout.write(`\r  ${cur}/${tot} ${status} ${cidr}    `);
         });
-        process.stdout.write("\r" + " ".repeat(60) + "\r");
+        process.stdout.write("\r" + " ".repeat(70) + "\r");
         console.log(cli.green(`  Unblocked: ${ranges.length} ranges`));
+        if (ranges.length === 0) {
+          console.error(cli.yellow("  All ranges blocked on your network."));
+          process.exit(1);
+        }
+        
+        // If -rangesonly is set, output only the working ranges (no IP expansion/scan)
+        if (args.rangesonly) {
+          const content = [
+            "# Working Cloudflare IP ranges (unblocked on your network)",
+            "# " + new Date().toISOString().slice(0, 10),
+            "# " + ranges.length + " ranges - use as Address in Xray config",
+            "",
+            ...ranges,
+          ].join("\n") + "\n";
+          fs.writeFileSync(outPath, content, "utf-8");
+          console.log(cli.green(`  Saved ${ranges.length} working ranges → ${outPath}`));
+          console.log("");
+          process.exit(0);
+        }
+        
+        console.log(cli.cyan("  Scanning for clean IPs (TCP + trace)..."));
+        setPingOptions({
+          routines: 50,
+          pingTimes: 1,
+          tcpPort,
+          url: "https://speed.cloudflare.com/__down",
+          traceUrl: "https://www.cloudflare.com/cdn-cgi/trace",
+          skipTrace: false,
+        });
+        const ipsToScan = loadIPsFromRanges(ranges);
+        const progress = createOverallProgress("Latency", ipsToScan.length);
+        const pingData = await runPing(ipsToScan, progress);
+        progress.done();
+        const cleanIps = pingData.map((d) => d.ip);
+        const content = [
+          "# Clean Cloudflare IPs (passed TCP + trace on your network)",
+          "# " + new Date().toISOString().slice(0, 10),
+          "# " + cleanIps.length + " IPs",
+          "",
+          ...cleanIps,
+        ].join("\n") + "\n";
+        fs.writeFileSync(outPath, content, "utf-8");
+        console.log(cli.green(`  Saved ${cleanIps.length} clean IPs → ${outPath}`));
+      } else {
+        const content = [
+          "# Cloudflare IP ranges (from cloudflare.com/ips)",
+          "# " + new Date().toISOString().slice(0, 10),
+          "",
+          ...ranges,
+        ].join("\n") + "\n";
+        fs.writeFileSync(outPath, content, "utf-8");
+        console.log(cli.green(`  Saved: ${outPath}`));
       }
-
-      const content = [
-        "# Cloudflare IP ranges" + (doProbe ? " (unblocked)" : ""),
-        "# " + new Date().toISOString().slice(0, 10),
-        "",
-        ...ranges,
-      ].join("\n") + "\n";
-      fs.writeFileSync(outPath, content, "utf-8");
-      console.log(cli.green(`  Saved: ${outPath}`));
       console.log("");
     } catch (err) {
       console.error(cli.yellow("  Fetch failed:"), err);
