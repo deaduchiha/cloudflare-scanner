@@ -6,9 +6,11 @@ import { URL } from "url";
 import type { CloudflareIPData } from "./types";
 import { createOverallProgress, OverallProgress, cli } from "./utils";
 
-const DEFAULT_TIMEOUT_SEC = 10;
+const DEFAULT_TIMEOUT_SEC = 20;
+const SPEED_TEST_BYTES = 1048576; // 1MB - completes quickly, reliable
+const FALLBACK_BYTES = 102400;    // 100KB - fallback if 1MB fails
 
-export let url = "https://speed.cloudflare.com/__down?bytes=52428800";
+export let url = "https://speed.cloudflare.com/__down?bytes=" + SPEED_TEST_BYTES;
 export let timeoutSec = DEFAULT_TIMEOUT_SEC;
 export let disable = false;
 export let testCount = 10;
@@ -31,11 +33,11 @@ export function setDownloadOptions(opts: {
 export let tcpPort = 443;
 
 /** Create HTTPS agent: connect to IP, TLS with SNI = hostname (required for Cloudflare). */
-function agentForIp(ip: string, hostname: string, port: number): https.Agent {
+function agentForIp(ip: string, hostname: string, port: number, connectTimeoutMs: number): https.Agent {
   const opts = {
     keepAlive: false,
     createConnection: (
-      options: { port: number; host: string; timeout?: number },
+      _options: { port: number; host: string; timeout?: number },
       callback: (err: Error | null, s?: net.Socket) => void
     ) => {
       const raw = net.connect(port, ip, () => {
@@ -46,20 +48,29 @@ function agentForIp(ip: string, hostname: string, port: number): https.Agent {
         tlsSocket.on("error", (err) => callback(err));
       });
       raw.on("error", (err) => callback(err));
-      raw.setTimeout(options.timeout || timeoutSec * 1000);
+      raw.setTimeout(connectTimeoutMs);
     },
   };
   return new https.Agent(opts as https.AgentOptions);
 }
 
-function downloadSpeed(ip: string): Promise<number> {
+async function downloadSpeed(ip: string): Promise<number> {
+  let speed = await downloadSpeedWithBytes(ip, SPEED_TEST_BYTES);
+  if (speed === 0) {
+    speed = await downloadSpeedWithBytes(ip, FALLBACK_BYTES);
+  }
+  return speed;
+}
+
+function downloadSpeedWithBytes(ip: string, bytes: number): Promise<number> {
   return new Promise((resolve) => {
     const u = new URL(url);
+    const path = (u.pathname || "/__down") + "?bytes=" + bytes;
     const isHttps = u.protocol === "https:";
     const port = Number(u.port) || (isHttps ? 443 : 80);
     const hostname = u.hostname;
-    const path = u.pathname + u.search;
     const timeoutMs = timeoutSec * 1000;
+    const connectTimeoutMs = Math.min(15000, timeoutMs);
 
     if (!isHttps) {
       const opts: http.RequestOptions = {
@@ -95,7 +106,7 @@ function downloadSpeed(ip: string): Promise<number> {
     }
 
     // HTTPS: connect to IP, TLS SNI = hostname
-    const agent = agentForIp(ip, hostname, port);
+    const agent = agentForIp(ip, hostname, port, connectTimeoutMs);
     const opts: https.RequestOptions = {
       host: ip,
       port,
@@ -137,6 +148,8 @@ function downloadSpeed(ip: string): Promise<number> {
   });
 }
 
+const SPEED_PARALLEL = 5;
+
 export async function testDownloadSpeed(
   ipSet: CloudflareIPData[],
   bar?: OverallProgress
@@ -146,7 +159,7 @@ export async function testDownloadSpeed(
     console.log(cli.dim("\n  No IPs from latency test; skipping speed test."));
     return ipSet;
   }
-  let testNum = Math.min(testCount, ipSet.length);
+  let testNum = Math.min(Math.max(testCount * 2, 15), ipSet.length);
   if (minSpeed > 0) testNum = ipSet.length;
 
   if (!bar) console.log("");
@@ -155,18 +168,25 @@ export async function testDownloadSpeed(
     progress.setLabel("Speed");
     progress.addTotal(testNum);
   }
-  const speedSet: CloudflareIPData[] = [];
-  for (let i = 0; i < testNum; i++) {
-    const speed = await downloadSpeed(ipSet[i].ip);
-    ipSet[i].downloadSpeed = speed;
-    const ok = speed >= minSpeed * 1024 * 1024;
-    progress.grow(1);
-    if (ok) {
-      speedSet.push(ipSet[i]);
-      if (speedSet.length >= testCount) break;
+
+  const results: CloudflareIPData[] = [];
+  const toTest = ipSet.slice(0, testNum);
+
+  for (let i = 0; i < toTest.length; i += SPEED_PARALLEL) {
+    const batch = toTest.slice(i, i + SPEED_PARALLEL);
+    const speeds = await Promise.all(batch.map((d) => downloadSpeed(d.ip)));
+    for (let j = 0; j < batch.length; j++) {
+      batch[j].downloadSpeed = speeds[j];
+      progress.grow(1);
+      if (speeds[j] > 0 && speeds[j] >= minSpeed * 1024 * 1024) {
+        results.push(batch[j]);
+      }
     }
+    if (results.length >= testCount) break;
   }
+
   if (!bar) progress.done();
-  const result = speedSet.length > 0 ? speedSet : ipSet;
-  return result;
+  const withSpeed = results.filter((d) => d.downloadSpeed > 0);
+  const sorted = [...withSpeed].sort((a, b) => b.downloadSpeed - a.downloadSpeed);
+  return sorted.length > 0 ? sorted : ipSet.slice(0, testNum);
 }

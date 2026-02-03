@@ -15,7 +15,7 @@ While Cloudflare exposes all [IP segment](https://www.cloudflare.com/ips/), but 
 
 ## How to use this app
 
-The app **tests Cloudflare IPs** (latency and optionally download speed), then **prints the best ones** so you can use them (e.g. in hosts or DNS).
+The app **tests Cloudflare IPs** (latency and optionally download speed), then **prints the best ones** so you can use them (e.g. in hosts, DNS, or Xray config).
 
 ### 1. First-time setup
 
@@ -28,61 +28,119 @@ npm run build
 
 After that you only need `node dist/index.js` (or `npm start`) to run a scan.
 
-### 2. How to scan IP ranges
+### 2. Quick start (recommended workflow)
 
-You can give ranges in **two ways**:
+```bash
+# Step 1: Fetch valid Cloudflare IP ranges into ip.txt
+node dist/index.js -fetch -extended
+
+# Step 2: Scan and find working IPs (use -xray for Xray Address)
+node dist/index.js -f ip.txt -xray config.json -o result.csv
+
+# Step 3 (optional): Discover working ranges for future scans
+node dist/index.js -f ip.txt -xray config.json -discover
+# Add working-ranges.txt to ip.txt for better results next time
+```
+
+### 3. How to scan IP ranges
 
 **Option A — From a file (default: `ip.txt`)**
 
-- Put one CIDR or IP per line in `ip.txt` (the project already has Cloudflare ranges in `ip.txt`).
-- Run with no extra args:  
-  `node dist/index.js`
+- Put one CIDR or IP per line in `ip.txt`.
+- Run: `node dist/index.js`
 
-**Option B — From the command line**
+**Option B — Fetch valid ranges first**
 
-- Use `-ip` and list ranges separated by commas:
+- Download Cloudflare's official IP list into ip.txt:
 
 ```bash
-# One range
-node dist/index.js -ip 104.16.0.0/13
-
-# Several ranges
-node dist/index.js -ip 104.16.0.0/13,172.64.0.0/13,1.1.1.1/32
-
-# Use your own file instead of ip.txt
-node dist/index.js -f my-ranges.txt
+node dist/index.js -fetch -extended -f ip.txt
 ```
 
-**Range format:** CIDR like `104.16.0.0/13` or single IP like `1.1.1.1` (same as `1.1.1.1/32`).
+- `-extended` adds 135.84.0.0/16 (works for Xray).
 
-### 3. What the app does
-
-1. **Latency test** — Connects to each IP on port 443 (by default), measures delay and packet loss.
-2. **Optional download test** — For the best IPs from step 1, measures download speed (use `-dd` to skip this).
-3. **Output** — Prints the top IPs (and optionally writes `result.csv`).
-
-### 4. Useful examples
+**Option C — From the command line**
 
 ```bash
-# Default: scan ip.txt, latency + download, top 10 results, save result.csv
+node dist/index.js -ip 104.16.0.0/13,172.64.0.0/13
+```
+
+**Option D — Scan around a working IP (for Xray)**
+
+```bash
+node dist/index.js -seed 135.84.76.19 -xray config.json
+```
+
+**Option E — Discover working ranges**
+
+- After a scan, find which /24 blocks have working IPs:
+
+```bash
+node dist/index.js -f ip.txt -xray config.json -discover -dr working-ranges.txt
+cat working-ranges.txt >> ip.txt
+```
+
+### 4. For Xray Address: use -xray to validate
+
+IPs that pass latency/speed tests may **not work** as Xray `Address`. To get IPs that actually work:
+
+```bash
+node dist/index.js -f ip.txt -xray config.json -o result.csv
+```
+
+Only IPs that pass the Xray proxy test will be output.
+
+### 5. What the app does
+
+1. **Latency test** — Connects to each IP on port 443, measures delay and packet loss.
+2. **Trace check** — Validates IP responds to Cloudflare trace (use `-skiptrace` to skip).
+3. **Download test** — Measures speed for top IPs (use `-dd` to skip).
+4. **Xray validation** (when `-xray` is used) — Tests each IP through the proxy; only working Addresses are output.
+5. **Output** — Prints top IPs and writes `result.csv`.
+
+### 6. Useful examples
+
+```bash
+# Fetch valid IP ranges
+node dist/index.js -fetch -extended
+
+# Default scan: ip.txt, latency + speed, top 10
 node dist/index.js
 
-# Only latency (no download test), show top 5
+# Xray: get working Address only
+node dist/index.js -f ip.txt -xray config.json -o result.csv
+
+# Latency only (no speed test), show top 5
 node dist/index.js -dd -p 5
 
-# Scan only the ranges you pass, no CSV file
-node dist/index.js -ip 172.64.0.0/13,104.16.0.0/13 -o ""
-
-# Stricter: max 150 ms latency, max 5% loss, show 20 results
+# Stricter: max 150 ms latency, max 5% loss
 node dist/index.js -tl 150 -tlr 0.05 -p 20
 
 # Help (all options)
 node dist/index.js -h
 ```
 
-### 5. Reading the output
+### 7. Reading the output
 
-The table shows for each IP: **IP**, **Sent/Received** (pings), **Loss rate**, **Average delay (ms)**, **Download speed (MB/s)**. Lower delay and loss and higher speed are better. Use one of the top IPs in your hosts file or DNS to reach Cloudflare sites through that IP.
+The table shows: **IP**, **Sent/Received**, **Loss rate**, **Average delay (ms)**, **Download speed (MB/s)**. Lower delay/loss and higher speed are better. Use the top IPs in hosts, DNS, or Xray config.
+
+### 8. Options reference
+
+| Option | Description |
+|--------|-------------|
+| `-fetch` | Fetch Cloudflare IP ranges from cloudflare.com → ip.txt |
+| `-extended` | With -fetch: add 135.84.0.0/16 (Xray working) |
+| `-f, -file` | IP list file (default: ip.txt) |
+| `-ip` | IP ranges from CLI, e.g. 104.16.0.0/13,172.64.0.0/13 |
+| `-seed` | Scan /24 around a working IP (e.g. 135.84.76.19) |
+| `-discover` | Find working /24 ranges from scan |
+| `-dr` | Output file for discovered ranges (default: working-ranges.txt) |
+| `-xray` | Xray config path — validates IPs via proxy (required for working Address) |
+| `-n` | Latency threads (default: 50) |
+| `-t` | Pings per IP (default: 1) |
+| `-dd` | Skip speed test |
+| `-o` | CSV output file (default: result.csv) |
+| `-p` | Show top N results (default: 10) |
 
 * * *
 
@@ -140,20 +198,20 @@ chmod +x CloudflareScanner
 
 ### Example of results
 
-After the speed test is completed, it will be displayed by default**Fastest 10 IPs**, example:
+After the speed test is completed, it will be displayed by default **Fastest 10 IPs**, example:
 
 ```bash
 IP Address      Sent  Received  Loss-Rate  Avg-Latency  Download Speed (MB/s)
-104.27.200.69     4       4       0.00         146.23    28.64
-172.67.60.78      4       4       0.00         139.82    15.02
-104.25.140.153    4       4       0.00         146.49    14.90
-104.27.192.65     4       4       0.00         140.28    14.07
-172.67.62.214     4       4       0.00         139.29    12.71
-104.27.207.5      4       4       0.00         145.92    11.95
-172.67.54.193     4       4       0.00         146.71    11.55
-104.22.66.8       4       4       0.00         147.42    11.11
-104.27.197.63     4       4       0.00         131.29    10.26
-172.67.58.91      4       4       0.00         140.19    9.14
+104.27.200.69     1       1       0.00         146.23    28.64
+172.67.60.78      1       1       0.00         139.82    15.02
+104.25.140.153    1       1       0.00         146.49    14.90
+104.27.192.65     1       1       0.00         140.28    14.07
+172.67.62.214     1       1       0.00         139.29    12.71
+104.27.207.5      1       1       0.00         145.92    11.95
+172.67.54.193     1       1       0.00         146.71    11.55
+104.22.66.8       1       1       0.00         147.42    11.11
+104.27.197.63     1       1       0.00         131.29    10.26
+172.67.58.91      1       1       0.00         140.19    9.14
 ...
 
 # If the average latency is very low (e.g., 0.xx), it indicates that CloudflareScanner is using a proxy during the speed test. Please disable any proxy software before conducting the test.
@@ -164,22 +222,22 @@ IP Address      Sent  Received  Loss-Rate  Avg-Latency  Download Speed (MB/s)
 # Note! I found that after the computer boots up, the first speed test may have noticeably higher latency (manual TCPing is the same), but subsequent tests are normal.
 # Therefore, it is recommended that before conducting the first official speed test after booting up, randomly test a few IPs (no need to wait for the latency test to complete, just close it once the progress bar moves).
 
-# The entire process of the software under the default parameters:
-# 1. Latency test (default TCPing mode, HTTPing mode requires manual addition of parameters)
-# 2. Latency sorting (sorting latency from low to high and filtering according to conditions, different loss rates are sorted separately, so there may be some IPs with low latency but loss at the end)
-# 3. Download speed test (starting from the IP with the lowest latency, downloading speed tests one by one, the default stops after testing 10)
-# 4. Speed sorting (sorting speeds from high to low)
-# 5. Output results (control whether to output to the command line with parameters (-p 0) or output to a file (-o ""))
+# The entire process under default parameters:
+# 1. Latency test (TCP connect + trace check)
+# 2. Latency sorting and filtering
+# 3. Download speed test (top IPs, parallel)
+# 4. Xray validation (if -xray provided)
+# 5. Output results (-p for print count, -o for CSV file)
 
 # Note: The result file result.csv will display Chinese garbled characters when opened with Microsoft Excel, which is normal. It displays normally in other spreadsheet software/notepad.
 ```
 
 The first line of the speed test result is**The fastest IP with the fastest download speed and lowest average latency**！
 
-The complete results are saved in the current directory`result.csv`file, use**Notepad/sheet software**Open, the format is as follows:
+The complete results are saved in `result.csv`. Format:
 
-    IP Address, Sent, Received, Loss Rate, Average Latency, Download Speed (MB/s)
-    104.27.200.69,4,4,0.00,146.23,28.64
+    IP Address,Sent,Received,Loss Rate,Average Delay,Download Speed (MB/s)
+    104.27.200.69,1,1,0.00,146.23,28.64
 
 > _You can view the complete results according to your own needs**Further filtering**, or take a look at the advanced usage**Specify filter criteria**！_
 

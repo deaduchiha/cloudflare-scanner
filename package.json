@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-clean-ip-scanner",
-  "version": "2.2.5",
+  "version": "1.0.0",
   "description": "Test Cloudflare CDN IP latency and speed (TypeScript/Node.js, Mac)",
   "main": "dist/index.js",
   "bin": {

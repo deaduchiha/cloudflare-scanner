@@ -16,14 +16,18 @@ import {
 import { setPingOptions, runPing } from "./ping";
 import { setDownloadOptions, testDownloadSpeed } from "./download";
 import { setXrayOptions, testXrayForIps } from "./xray";
+import { ipToCidr24 } from "./ip";
+import { fetchCloudflareRanges, formatRangesForFile } from "./fetch";
+import * as fs from "fs";
 
-const VERSION = "2.2.5";
+const VERSION = "1.0.0";
 
 const LONG_TO_SHORT: Record<string, string> = {
   help: "help",
   version: "version",
   threads: "n",
   pingtimes: "t",
+  traceurl: "traceurl",
   downloadn: "dn",
   downloadsec: "dt",
   port: "tp",
@@ -34,6 +38,7 @@ const LONG_TO_SHORT: Record<string, string> = {
   file: "f",
   output: "o",
   ip: "ip",
+  discoverranges: "dr",
 };
 
 function parseArgs(): Record<string, string | number | boolean> {
@@ -44,7 +49,7 @@ function parseArgs(): Record<string, string | number | boolean> {
     "httpingcode", "xraytimeout", "xrayn",
   ];
   const floatKeys = ["tlr", "sl"];
-  const flagKeys = ["httping", "dd", "allip"];
+  const flagKeys = ["httping", "dd", "allip", "skiptrace", "discover", "fetch", "extended"];
 
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -91,16 +96,18 @@ const HELP = `
     npx cloudflare-scanner -f ip.txt -o result.csv -xray config.json
 
   SCAN
-    -n, --threads <N>     Latency threads (default: 10, max: 1000)
-    -t, --ping-times <N>  Pings per IP (default: 4)
+    -n, --threads <N>     Latency threads (default: 50, max: 1000)
+    -t, --ping-times <N>  Pings per IP (default: 1)
     -tp, --port <N>       Test port (default: 443)
     -url <url>            Test URL (default: speed.cloudflare.com)
+    -traceurl <url>       Trace URL for clean IP check (default: www.cloudflare.com/cdn-cgi/trace)
+    -skiptrace            Skip trace check (faster, less accurate)
     -httping              Use HTTP instead of TCP for latency
     -cfcolo <codes>       Match region, e.g. HKG,KHH (HTTP only)
 
   SPEED
     -dn, --download-n <N> How many IPs to speed-test (default: 10)
-    -dt, --download-sec   Seconds per speed test (default: 10)
+    -dt, --download-sec   Seconds per speed test (default: 20)
     -dd                   Skip speed test (latency only)
     -sl <N>               Min speed MB/s (filter)
 
@@ -112,12 +119,17 @@ const HELP = `
   INPUT / OUTPUT
     -f, --file <path>     IP list file (default: ip.txt)
     -ip <ranges>          IPs from CLI, e.g. 1.1.1.1,2.2.2.2/24
+    -seed <ip>            Scan /24 around working IP (e.g. 135.84.76.19)
+    -fetch                Fetch valid Cloudflare IP ranges → ip.txt
+    -extended             With -fetch: include 135.84.x.x (Xray working)
+    -discover             Find working ranges from scan → write /24 blocks to -dr file
+    -dr, --discover-ranges <path>  Output working ranges (default: working-ranges.txt)
     -o, --output <path>   CSV output (default: result.csv, "" = none)
     -p, --print <N>       Show top N results (default: 10, 0 = none)
     -allip                Test every IP in range (IPv4, slower)
 
-  XRAY (optional)
-    -xray <path>          Config JSON; outbound address = clean IP
+  XRAY (required for working Address)
+    -xray <path>          Config JSON; validates IPs via proxy (only these work!)
     -xraybin <path>       Xray binary (default: xray)
     -xrayurl <url>        URL to test via proxy
     -xraytimeout <sec>    Timeout per IP (default: 10)
@@ -155,11 +167,31 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (args.fetch) {
+    const outPath = (args.f as string) || "ip.txt";
+    const includeExtended = !!args.extended;
+    console.log("");
+    console.log(cli.bold("  Fetching valid Cloudflare IP ranges..."));
+    try {
+      const { ipv4, ipv6 } = await fetchCloudflareRanges();
+      const content = formatRangesForFile(ipv4, ipv6, includeExtended);
+      fs.writeFileSync(outPath, content, "utf-8");
+      console.log(cli.green(`  Saved: ${outPath}`));
+      console.log(cli.dim(`  IPv4: ${ipv4.length} ranges, IPv6: ${ipv6.length} ranges`));
+      if (includeExtended) console.log(cli.dim("  + extended (135.84.0.0/16 for Xray)"));
+      console.log("");
+    } catch (err) {
+      console.error(cli.yellow("  Fetch failed:"), err);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
 
   setIPOptions({
     testAll: !!args.allip,
     ipFile: (args.f as string) || "ip.txt",
     ipText: (args.ip as string) || "",
+    seedIp: (args.seed as string) || "",
   });
   setUtilsOptions({
     inputMaxDelayMs: (args.tl as number) || 9999,
@@ -169,30 +201,33 @@ async function main(): Promise<void> {
     printNum: (args.p as number) ?? 10,
   });
   setPingOptions({
-    routines: (args.n as number) || 10,
-    pingTimes: (args.t as number) || 4,
+    routines: (args.n as number) || 50,
+    pingTimes: (args.t as number) || 1,
     tcpPort: (args.tp as number) || 443,
-    url: (args.url as string) || "https://speed.cloudflare.com/__down?bytes=52428800",
+    url: (args.url as string) || "https://speed.cloudflare.com/__down",
+    traceUrl: (args.traceurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
+    skipTrace: !!args.skiptrace,
     httping: !!args.httping,
     httpingStatusCode: (args.httpingcode as number) || 0,
     httpingCFColo: (args.cfcolo as string) || "",
   });
   setDownloadOptions({
-    url: (args.url as string) || "https://speed.cloudflare.com/__down?bytes=52428800",
-    timeoutSec: (args.dt as number) || 10,
+    url: (args.url as string) || "https://speed.cloudflare.com/__down",
+    timeoutSec: (args.dt as number) || 20,
     disable: !!args.dd,
     testCount: (args.dn as number) || 10,
     minSpeed: (args.sl as number) || 0,
   });
+  const xrayPath = args.xray as string;
   setXrayOptions({
-    configPath: (args.xray as string) || "",
+    configPath: xrayPath || "",
     bin: (args.xraybin as string) || "xray",
     testUrl: (args.xrayurl as string) || "https://www.cloudflare.com/cdn-cgi/trace",
     timeoutSec: (args.xraytimeout as number) || 10,
-    maxCount: (args.xrayn as number) || 0,
+    maxCount: (args.xrayn as number) ?? (xrayPath ? 50 : 0),
   });
 
-  const source = ipText ? "CLI" : ipFile || "ip.txt";
+  const source = (args.ip as string) ? "CLI" : (args.seed as string) ? "seed" : ipFile || "ip.txt";
   const ips = loadIPRanges();
   if (ips.length === 0) {
     console.error(cli.dim("No IPs. Use -f <file> or -ip <ranges>."));
@@ -203,6 +238,9 @@ async function main(): Promise<void> {
   console.log("");
   console.log(cli.bold("  CloudflareScanner " + VERSION) + cli.dim(`  · ${source}`));
   console.log(cli.dim(`  IPs: ${ips.length}${r ? ` (${r} ranges)` : ""}`));
+  if (xrayPath) {
+    console.log(cli.cyan("  Xray: validating via proxy - only working Address will be output"));
+  }
   if ((args.sl as number) > 0 && (args.tl as number) === 9999) {
     console.log(cli.yellow("  Tip: use -tl to cap latency and speed up when using -sl"));
   }
@@ -214,14 +252,47 @@ async function main(): Promise<void> {
   pingData = filterDelay(pingData);
   pingData = filterLossRate(pingData);
 
+  const useXray = !!(args.xray as string);
   let speedData = await testDownloadSpeed(pingData, progress);
   speedData = sortBySpeed(speedData);
 
-  const finalData = await testXrayForIps(speedData, progress);
+  const hasRealSpeed = speedData.some((d) => d.downloadSpeed > 0);
+  if (!hasRealSpeed && speedData.length > 0 && !args.dd) {
+    console.log(cli.yellow("  Note: Speed test returned 0 for all IPs. Use -dd to skip speed test."));
+  }
+  const finalData = hasRealSpeed
+    ? speedData.filter((d) => d.downloadSpeed > 0)
+    : speedData;
+
+  const xrayInput = useXray
+    ? pingData.slice(0, 50)
+    : finalData;
+  const outputData = await testXrayForIps(xrayInput, progress);
   progress.done();
 
-  exportCsv(finalData);
-  printResults(finalData);
+  exportCsv(outputData);
+  printResults(outputData);
+
+  if (args.discover) {
+    const workingIps = outputData.length > 0 ? outputData : pingData.slice(0, 100);
+    const ranges = new Set<string>();
+    for (const d of workingIps) {
+      const cidr = ipToCidr24(d.ip);
+      if (cidr) ranges.add(cidr);
+    }
+    const rangeList = [...ranges].sort();
+    const drPath = (args.dr as string) || "working-ranges.txt";
+    const header = [
+      "# Working IP ranges (discovered from scan)",
+      "# Add these to ip.txt for better results",
+      "",
+      ...rangeList,
+    ].join("\n") + "\n";
+    fs.writeFileSync(drPath, header, "utf-8");
+    console.log(cli.green(`  Discovered ${rangeList.length} working ranges → ${drPath}`));
+    console.log(cli.dim("  Add these to ip.txt for future scans"));
+    console.log("");
+  }
 
   const versionNew = await checkUpdate();
   if (versionNew) {

@@ -9,12 +9,14 @@ import { createOverallProgress, OverallProgress } from "./utils";
 
 const TCP_CONNECT_TIMEOUT = 1000;
 
-export let routines = 10;
+export let routines = 50;
 export let tcpPort = 443;
-export let pingTimes = 4;
+export let pingTimes = 1;
 export let httping = false;
 export let httpingStatusCode = 0;
 export let url = "https://speed.cloudflare.com/__down?bytes=52428800";
+export let traceUrl = "https://www.cloudflare.com/cdn-cgi/trace";
+export let skipTrace = false;
 export let httpingCFColo = "";
 let httpingCFColomap: Set<string> | null = null;
 
@@ -28,6 +30,8 @@ export function setPingOptions(opts: {
   httping?: boolean;
   httpingStatusCode?: number;
   url?: string;
+  traceUrl?: string;
+  skipTrace?: boolean;
   httpingCFColo?: string;
 }) {
   if (opts.routines !== undefined)
@@ -38,6 +42,8 @@ export function setPingOptions(opts: {
   if (opts.httpingStatusCode !== undefined)
     httpingStatusCode = opts.httpingStatusCode;
   if (opts.url !== undefined) url = opts.url;
+  if (opts.traceUrl !== undefined) traceUrl = opts.traceUrl;
+  if (opts.skipTrace !== undefined) skipTrace = opts.skipTrace;
   if (opts.httpingCFColo !== undefined) {
     httpingCFColo = opts.httpingCFColo;
     httpingCFColomap = httpingCFColo
@@ -112,7 +118,7 @@ function parseTraceBody(body: string): boolean {
 }
 
 function checkCdnTrace(ip: string): Promise<boolean> {
-  const u = new URL(url);
+  const u = new URL(traceUrl);
   const isHttps = u.protocol === "https:";
   const port = Number(u.port) || (isHttps ? 443 : 80);
   const hostname = u.hostname;
@@ -260,8 +266,10 @@ async function runOne(ip: string, bar: OverallProgress): Promise<CloudflareIPDat
   const { recv, totalDelayMs } = await checkConnection(ip);
   bar.grow(1);
   if (recv === 0) return null;
-  const traceOk = await checkCdnTrace(ip);
-  if (!traceOk) return null;
+  if (!skipTrace) {
+    const traceOk = await checkCdnTrace(ip);
+    if (!traceOk) return null;
+  }
   return {
     ip,
     sent: pingTimes,
