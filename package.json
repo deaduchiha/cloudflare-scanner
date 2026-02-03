@@ -1,7 +1,7 @@
 {
   "name": "cloudflare-clean-ip-scanner",
-  "version": "1.0.0",
-  "description": "Test Cloudflare CDN IP latency and speed (TypeScript/Node.js, Mac)",
+  "version": "2.0.0",
+  "description": "Fetch Cloudflare IP ranges and filter clean IPs based on your network",
   "main": "dist/index.js",
   "bin": {
     "cfscan": "dist/index.js"
@@ -15,7 +15,12 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["cloudflare", "ip", "scanner", "latency", "speed"],
+  "keywords": [
+    "cloudflare",
+    "ip",
+    "scanner",
+    "clean"
+  ],
   "license": "MIT",
   "dependencies": {
     "ip-cidr": "^4.0.2"

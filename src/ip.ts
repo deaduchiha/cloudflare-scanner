@@ -1,28 +1,4 @@
-import * as fs from "fs";
-import * as path from "path";
 import IpCidr from "ip-cidr";
-
-const DEFAULT_IP_FILE = "ip.txt";
-
-export let testAll = false;
-export let ipFile = DEFAULT_IP_FILE;
-export let ipText = "";
-export let seedIp = "";
-
-/** Last loaded CIDR lines (for display). Set by loadIPRanges(). */
-export let lastLoadedRanges: string[] = [];
-
-export function setIPOptions(opts: {
-  testAll?: boolean;
-  ipFile?: string;
-  ipText?: string;
-  seedIp?: string;
-}) {
-  if (opts.testAll !== undefined) testAll = opts.testAll;
-  if (opts.ipFile !== undefined) ipFile = opts.ipFile;
-  if (opts.ipText !== undefined) ipText = opts.ipText;
-  if (opts.seedIp !== undefined) seedIp = opts.seedIp;
-}
 
 export function isIPv4Export(ip: string): boolean {
   return ip.includes(".");
@@ -39,15 +15,21 @@ function fixIP(ip: string): string {
   return ip;
 }
 
-/** Convert single IPv4 to /24 range for scanning nearby IPs. */
-export function ipToCidr24(ip: string): string | null {
-  if (!isIPv4(ip) || ip.includes("/")) return null;
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+/**
+ * Get the first IP of a CIDR range.
+ * Used to check if a whole Cloudflare range is usable on your network.
+ */
+export function getStartIp(cidr: string): string | null {
+  try {
+    const c = new IpCidr(cidr.trim());
+    const start = c.start() as string;
+    return start || null;
+  } catch {
+    return null;
+  }
 }
 
-/** IPv4: one random IP per /24 block, or all IPs if testAll (capped). */
+/** IPv4: one random IP per /24 block (kept for possible future use). */
 function chooseIPv4(cidr: string): string[] {
   try {
     const c = new IpCidr(cidr);
@@ -58,13 +40,6 @@ function chooseIPv4(cidr: string): string[] {
     if (parts.length !== 4) return [];
     const prefix = parseInt(cidr.split("/")[1] || "32", 10);
     if (prefix >= 32) return [start];
-
-    if (testAll) {
-      const out: string[] = [];
-      const max = 15000;
-      const arr = c.toArray({ from: 0, limit: max });
-      return Array.isArray(arr) ? arr : [];
-    }
 
     const result: string[] = [];
     const toNum = (a: number, b: number, c: number, d: number) =>
@@ -90,7 +65,7 @@ function chooseIPv4(cidr: string): string[] {
   }
 }
 
-/** IPv6: single or one random. */
+/** IPv6: single or one random (kept for possible future use). */
 function chooseIPv6(cidr: string): string[] {
   if (cidr.endsWith("/128")) {
     return [cidr.replace("/128", "")];
@@ -117,60 +92,12 @@ function parseCIDR(line: string): string[] {
   return chooseIPv6(fixed);
 }
 
-export function loadIPRanges(): string[] {
-  const ips: string[] = [];
-  lastLoadedRanges = [];
-  const addRange = (cidr: string) => {
-    lastLoadedRanges.push(cidr);
-    parseCIDR(cidr).forEach((ip) => ips.push(ip));
-  };
-  if (seedIp) {
-    const cidr24 = ipToCidr24(seedIp.trim());
-    if (cidr24) addRange(cidr24);
-  }
-  if (ipText) {
-    ipText.split(",").forEach((entry) => {
-      const t = entry.trim();
-      if (!t) return;
-      addRange(t);
-    });
-    return ips;
-  }
-  const filePath = path.resolve(ipFile || DEFAULT_IP_FILE);
-  if (!fs.existsSync(filePath)) {
-    if (ips.length === 0) {
-      console.error(`IP file not found: ${filePath}`);
-      process.exit(1);
-    }
-  } else {
-    const content = fs.readFileSync(filePath, "utf-8");
-    content.split(/\r?\n/).forEach((line) => {
-      const t = line.trim();
-      if (!t || t.startsWith("#")) return;
-      addRange(t);
-    });
-  }
-  return ips;
-}
-
-/** Parse CIDR lines from file content (no IP expansion). */
-export function parseRangesFromContent(content: string): string[] {
-  const cidrs: string[] = [];
-  content.split(/\r?\n/).forEach((line) => {
-    const t = line.trim();
-    if (!t || t.startsWith("#")) return;
-    const fixed = fixIP(t);
-    if (IpCidr.isValidCIDR(fixed)) cidrs.push(fixed);
-  });
-  return cidrs;
-}
-
-/** Load IPs from a list of CIDR ranges (used after probe filter). */
+/** Load IPs from a list of CIDR ranges (not used by the new flow). */
 export function loadIPsFromRanges(cidrs: string[]): string[] {
   const ips: string[] = [];
-  lastLoadedRanges = [];
   for (const cidr of cidrs) {
-    lastLoadedRanges.push(cidr);
+    const t = cidr.trim();
+    if (!t || t.startsWith("#")) continue;
     parseCIDR(cidr).forEach((ip) => ips.push(ip));
   }
   return ips;
