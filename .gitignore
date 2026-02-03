@@ -5,3 +5,6 @@ dist/
 
 config.json
 subnets.txt
+clean-ips-plain.txt
+clean-ips.txt
+cloudflare-subnets.txt
