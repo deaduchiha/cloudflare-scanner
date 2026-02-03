@@ -86,6 +86,14 @@ function rangesOverlap(
   return a.start <= b.end && b.start <= a.end;
 }
 
+/** Check if range A is fully contained within range B */
+function rangeContainedIn(
+  inner: { start: number; end: number },
+  outer: { start: number; end: number }
+): boolean {
+  return inner.start >= outer.start && inner.end <= outer.end;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CLOUDFLARE RANGE MATCHER - Binary search for O(log n) lookups
 // ═══════════════════════════════════════════════════════════════════════════
@@ -142,6 +150,41 @@ class CloudflareRangeMatcher {
     return false;
   }
 
+  /**
+   * Check if a subnet is FULLY CONTAINED within any Cloudflare range.
+   * Stricter than overlap: excludes 0.0.0.0/0 and partial overlaps.
+   */
+  containedInCloudflare(cidr: string): boolean {
+    const target = cidrToRange(cidr);
+    if (!target) return false;
+
+    // Skip catch-all subnets (0.0.0.0/0, ::/0) - never meaningful
+    if (target.start === 0 && target.end === 0xffffffff) return false;
+
+    // Binary search to find potential containing ranges
+    let left = 0;
+    let right = this.ranges.length - 1;
+
+    while (left < right) {
+      const mid = Math.floor((left + right) / 2);
+      if (this.ranges[mid].end < target.start) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+
+    for (let i = left; i < this.ranges.length; i++) {
+      const cfRange = this.ranges[i];
+      if (cfRange.start > target.end) break;
+      if (rangeContainedIn(target, cfRange)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   /** Get the matching Cloudflare range if overlaps */
   getMatchingRange(cidr: string): string | null {
     const target = cidrToRange(cidr);
@@ -183,8 +226,9 @@ async function streamSubnets(
         return;
       }
 
-      // Check if this subnet overlaps with Cloudflare ranges
-      if (matcher.overlapsCloudflare(trimmed)) {
+      // Check if this subnet is fully contained within Cloudflare ranges
+      // (stricter than overlap - excludes 0.0.0.0/0 and partial overlaps)
+      if (matcher.containedInCloudflare(trimmed)) {
         cloudflareSubnets.push(trimmed);
       }
 
