@@ -26,7 +26,7 @@ const CONFIG = {
   // Scanning
   CONCURRENCY: 100, // High concurrency for speed
   SAMPLES_PER_RANGE: 3, // IPs to test per subnet
-  TIMEOUT_MS: 4000, // Connection timeout
+  TIMEOUT_MS: 6000, // Connection timeout (slower networks)
   MIN_SUCCESS_RATE: 0.5, // 50% must pass
   MAX_AVG_LATENCY: 3000, // Max acceptable latency (ms)
 
@@ -38,6 +38,10 @@ const CONFIG = {
   // Cloudflare URLs
   CF_IPV4_URL: "https://www.cloudflare.com/ips-v4",
   CF_IPV6_URL: "https://www.cloudflare.com/ips-v6",
+
+  // Probe URL: where to test connectivity (default: biatid.ir)
+  // Use PROBE_URL env or --probe-url to override
+  PROBE_URL: "https://biatid.ir/pull/",
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -82,6 +86,18 @@ function cidrToRange(cidr: string): { start: number; end: number } | null {
 function isCatchAllSubnet(cidr: string): boolean {
   const trimmed = cidr.trim();
   return trimmed === "0.0.0.0/0" || trimmed === "::/0";
+}
+
+/** Extract CIDR from line (handles prefixes like "L1:192.168.0.0/24") */
+function extractCidr(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  const v4 = trimmed.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2})/);
+  if (v4) return v4[1];
+  const v6 = trimmed.match(/([0-9a-fA-F:]+(?::[0-9a-fA-F:]+)*\/\d{1,3})/);
+  if (v6) return v6[1];
+  if (trimmed.includes("/")) return trimmed;
+  return null;
 }
 
 /** Check if two ranges overlap */
@@ -232,10 +248,11 @@ async function streamSubnets(
         return;
       }
 
+      const cidr = extractCidr(trimmed) || trimmed;
       // Check if this subnet overlaps with Cloudflare ranges (includes partial overlaps)
       // Exclude 0.0.0.0/0 explicitly - it overlaps everything but is meaningless to scan
-      if (matcher.overlapsCloudflare(trimmed) && !isCatchAllSubnet(trimmed)) {
-        cloudflareSubnets.push(trimmed);
+      if (matcher.overlapsCloudflare(cidr) && !isCatchAllSubnet(cidr)) {
+        cloudflareSubnets.push(cidr);
       }
 
       processed++;
@@ -254,16 +271,198 @@ async function streamSubnets(
   });
 }
 
+/** Read ALL subnets from file (no Cloudflare filter). Use --all when you trust your list. */
+async function streamAllSubnets(
+  filePath: string,
+  onProgress: (processed: number) => void
+): Promise<string[]> {
+  const subnets: string[] = [];
+  let processed = 0;
+
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+    rl.on("line", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) {
+        processed++;
+        return;
+      }
+      const cidr = extractCidr(trimmed) || trimmed;
+      if (!isCatchAllSubnet(cidr)) {
+        subnets.push(cidr);
+      }
+      processed++;
+      if (processed % 10000 === 0) onProgress(processed);
+    });
+
+    rl.on("close", () => {
+      onProgress(processed);
+      resolve(subnets);
+    });
+
+    rl.on("error", reject);
+    stream.on("error", reject);
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
-// CLOUDFLARE TRACE VERIFICATION
+// PROBE CONFIG - Custom URL support (like curl --resolve)
 // ═══════════════════════════════════════════════════════════════════════════
 
-function checkCloudflareTrace(
-  ip: string
+interface ProbeConfig {
+  host: string;
+  path: string;
+  port: number;
+  isTraceEndpoint: boolean; // true = check colo=/ip=, false = check HTTP 2xx
+}
+
+function parseProbeUrl(url: string): ProbeConfig {
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+  }
+  const u = new URL(url);
+  const port = u.port
+    ? parseInt(u.port, 10)
+    : u.protocol === "https:"
+    ? 443
+    : 80;
+  const path = u.pathname || "/";
+  const isTraceEndpoint =
+    u.hostname === "www.cloudflare.com" && path.includes("/cdn-cgi/trace");
+  return {
+    host: u.hostname,
+    path: path + (u.search || ""),
+    port,
+    isTraceEndpoint,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONNECTIVITY PROBE (connect to IP, request URL - like curl --resolve)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function runHttpRequest(
+  socket: net.Socket | tls.TLSSocket,
+  probe: ProbeConfig,
+  data: { buf: string },
+  timeout: ReturnType<typeof setTimeout>,
+  done: (ok: boolean) => void
+): void {
+  const request = [
+    `GET ${probe.path} HTTP/1.1`,
+    `Host: ${probe.host}`,
+    "Connection: close",
+    "User-Agent: Mozilla/5.0",
+    "",
+    "",
+  ].join("\r\n");
+
+  socket.write(request);
+
+  socket.on("data", (chunk) => {
+    data.buf += chunk.toString();
+    if (probe.isTraceEndpoint) {
+      if (data.buf.includes("colo=") && data.buf.includes("ip=")) {
+        clearTimeout(timeout);
+        socket.destroy();
+        done(true);
+      }
+    } else {
+      const match = data.buf.match(/HTTP\/\d\.\d\s+(\d{3})/);
+      if (match) {
+        const code = parseInt(match[1], 10);
+        clearTimeout(timeout);
+        socket.destroy();
+        // Accept any HTTP response (100-599 = IP reached the URL)
+        done(code >= 100 && code < 600);
+      }
+    }
+  });
+
+  socket.on("end", () => {
+    clearTimeout(timeout);
+    if (probe.isTraceEndpoint) {
+      done(data.buf.includes("colo=") && data.buf.includes("ip="));
+    } else {
+      const match = data.buf.match(/HTTP\/\d\.\d\s+(\d{3})/);
+      // Accept any HTTP response (100-599 = IP reached the URL)
+      done(
+        match
+          ? parseInt(match[1], 10) >= 100 && parseInt(match[1], 10) < 600
+          : false
+      );
+    }
+  });
+
+  socket.on("error", () => {
+    clearTimeout(timeout);
+    done(false);
+  });
+}
+
+/** For --verbose: probe and return raw response for debugging */
+async function probeWithRawResponse(
+  ip: string,
+  probe: ProbeConfig
+): Promise<{ ok: boolean; raw: string }> {
+  return new Promise((resolve) => {
+    const data = { buf: "" };
+    const timeout = setTimeout(
+      () => resolve({ ok: false, raw: data.buf }),
+      CONFIG.TIMEOUT_MS
+    );
+
+    const done = (ok: boolean) => {
+      clearTimeout(timeout);
+      resolve({ ok, raw: data.buf });
+    };
+
+    const socket = net.connect(probe.port, ip, () => {
+      if (probe.port === 443) {
+        const tlsSocket = tls.connect(
+          { socket, servername: probe.host, rejectUnauthorized: false },
+          () => {
+            tlsSocket.write(
+              `GET ${probe.path} HTTP/1.1\r\nHost: ${probe.host}\r\nConnection: close\r\n\r\n`
+            );
+            tlsSocket.on("data", (c) => (data.buf += c.toString()));
+            tlsSocket.on("end", () =>
+              done(
+                probe.isTraceEndpoint
+                  ? data.buf.includes("colo=") && data.buf.includes("ip=")
+                  : /HTTP\/\d\.\d\s+[1-5]\d{2}/.test(data.buf)
+              )
+            );
+            tlsSocket.on("error", () => done(false));
+          }
+        );
+        tlsSocket.on("error", () => done(false));
+      } else {
+        socket.write(
+          `GET ${probe.path} HTTP/1.1\r\nHost: ${probe.host}\r\nConnection: close\r\n\r\n`
+        );
+        socket.on("data", (c) => (data.buf += c.toString()));
+        socket.on("end", () =>
+          done(/HTTP\/\d\.\d\s+([2345]\d{2})/.test(data.buf))
+        );
+        socket.on("error", () => done(false));
+      }
+    });
+    socket.on("error", () => done(false));
+    socket.setTimeout(CONFIG.TIMEOUT_MS, () => done(false));
+  });
+}
+
+function checkProbe(
+  ip: string,
+  probe: ProbeConfig
 ): Promise<{ ok: boolean; latencyMs: number }> {
   return new Promise((resolve) => {
     const start = Date.now();
     let resolved = false;
+    const data = { buf: "" };
 
     const done = (ok: boolean) => {
       if (resolved) return;
@@ -273,51 +472,23 @@ function checkCloudflareTrace(
 
     const timeout = setTimeout(() => done(false), CONFIG.TIMEOUT_MS);
 
-    const socket = net.connect(443, ip, () => {
-      const tlsSocket = tls.connect(
-        {
-          socket,
-          servername: "www.cloudflare.com",
-          rejectUnauthorized: false,
-        },
-        () => {
-          const request = [
-            "GET /cdn-cgi/trace HTTP/1.1",
-            "Host: www.cloudflare.com",
-            "Connection: close",
-            "User-Agent: Mozilla/5.0",
-            "",
-            "",
-          ].join("\r\n");
-
-          tlsSocket.write(request);
-
-          let data = "";
-          tlsSocket.on("data", (chunk) => {
-            data += chunk.toString();
-            if (data.includes("colo=") && data.includes("ip=")) {
-              clearTimeout(timeout);
-              tlsSocket.destroy();
-              done(true);
-            }
-          });
-
-          tlsSocket.on("end", () => {
-            clearTimeout(timeout);
-            done(data.includes("colo=") && data.includes("ip="));
-          });
-
-          tlsSocket.on("error", () => {
-            clearTimeout(timeout);
-            done(false);
-          });
-        }
-      );
-
-      tlsSocket.on("error", () => {
-        clearTimeout(timeout);
-        done(false);
-      });
+    const socket = net.connect(probe.port, ip, () => {
+      if (probe.port === 443) {
+        const tlsSocket = tls.connect(
+          {
+            socket,
+            servername: probe.host,
+            rejectUnauthorized: false,
+          },
+          () => runHttpRequest(tlsSocket, probe, data, timeout, done)
+        );
+        tlsSocket.on("error", () => {
+          clearTimeout(timeout);
+          done(false);
+        });
+      } else {
+        runHttpRequest(socket, probe, data, timeout, done);
+      }
     });
 
     socket.on("error", () => {
@@ -367,13 +538,17 @@ interface ScanResult {
   passed: boolean;
 }
 
+let PROBE_CONFIG: ProbeConfig;
+
 async function scanSubnet(cidr: string): Promise<ScanResult> {
   const ips = getRandomIps(cidr, CONFIG.SAMPLES_PER_RANGE);
   if (ips.length === 0) {
     return { cidr, successRate: 0, avgLatency: 0, passed: false };
   }
 
-  const results = await Promise.all(ips.map((ip) => checkCloudflareTrace(ip)));
+  const results = await Promise.all(
+    ips.map((ip) => checkProbe(ip, PROBE_CONFIG))
+  );
   const successes = results.filter((r) => r.ok);
   const successRate = successes.length / results.length;
 
@@ -397,7 +572,8 @@ async function scanAllSubnets(
     total: number,
     current: string,
     passed: boolean
-  ) => void
+  ) => void,
+  onClean?: (result: ScanResult) => void
 ): Promise<ScanResult[]> {
   const results: ScanResult[] = [];
   let index = 0;
@@ -410,6 +586,7 @@ async function scanAllSubnets(
       const result = await scanSubnet(cidr);
       results.push(result);
       done++;
+      if (result.passed) onClean?.(result);
       onProgress(done, subnets.length, cidr, result.passed);
     }
   };
@@ -436,6 +613,35 @@ function progressBar(current: number, total: number, width = 30): string {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════
 
+function parseArgs(): {
+  inputFile: string;
+  probeUrl: string;
+  verbose: boolean;
+  all: boolean;
+} {
+  const args = process.argv.slice(2);
+  const verbose = args.includes("--verbose") || args.includes("-v");
+  const all = args.includes("--all") || args.includes("-a");
+  const probeIdx = args.findIndex((a) => a === "--probe-url" || a === "-u");
+  const probeUrl =
+    probeIdx >= 0 && args[probeIdx + 1]
+      ? args[probeIdx + 1]
+      : process.env.PROBE_URL || CONFIG.PROBE_URL;
+  const fileArgs = args.filter(
+    (a) =>
+      a !== "--verbose" &&
+      a !== "-v" &&
+      a !== "--all" &&
+      a !== "-a" &&
+      a !== "--probe-url" &&
+      a !== "-u" &&
+      (probeIdx < 0 || a !== args[probeIdx + 1])
+  );
+  const inputFile =
+    fileArgs.find((a) => !a.startsWith("-")) || CONFIG.INPUT_FILE;
+  return { inputFile, probeUrl, verbose, all };
+}
+
 async function main(): Promise<void> {
   console.log("");
   console.log(
@@ -449,7 +655,8 @@ async function main(): Promise<void> {
   );
   console.log("");
 
-  const inputFile = process.argv[2] || CONFIG.INPUT_FILE;
+  const { inputFile, probeUrl, verbose, all } = parseArgs();
+  PROBE_CONFIG = parseProbeUrl(probeUrl);
 
   if (!fs.existsSync(inputFile)) {
     console.error(cli.yellow(`  File not found: ${inputFile}`));
@@ -459,119 +666,176 @@ async function main(): Promise<void> {
   const stats = fs.statSync(inputFile);
   const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
   console.log(cli.cyan(`  Input file: ${inputFile} (${fileSizeMB} MB)`));
-  console.log("");
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 1: Fetch official Cloudflare ranges
-  // ─────────────────────────────────────────────────────────────────────────
-  console.log(cli.cyan("  [1/4] Fetching official Cloudflare IP ranges..."));
-
-  let cfRanges: string[];
-  try {
-    const [v4Res, v6Res] = await Promise.all([
-      fetch(CONFIG.CF_IPV4_URL, { signal: AbortSignal.timeout(15000) }),
-      fetch(CONFIG.CF_IPV6_URL, { signal: AbortSignal.timeout(15000) }),
-    ]);
-
-    const v4Text = await v4Res.text();
-    const v6Text = await v6Res.text();
-
-    cfRanges = [
-      ...v4Text.split(/\r?\n/).filter((s) => s.trim() && !s.startsWith("#")),
-      ...v6Text.split(/\r?\n/).filter((s) => s.trim() && !s.startsWith("#")),
-    ];
-  } catch {
-    // Fallback to known Cloudflare ranges if fetch fails
-    console.log(cli.yellow("  Failed to fetch, using built-in ranges..."));
-    cfRanges = [
-      "173.245.48.0/20",
-      "103.21.244.0/22",
-      "103.22.200.0/22",
-      "103.31.4.0/22",
-      "141.101.64.0/18",
-      "108.162.192.0/18",
-      "190.93.240.0/20",
-      "188.114.96.0/20",
-      "197.234.240.0/22",
-      "198.41.128.0/17",
-      "162.158.0.0/15",
-      "104.16.0.0/13",
-      "104.24.0.0/14",
-      "172.64.0.0/13",
-      "131.0.72.0/22",
-    ];
+  if (all) {
+    console.log(
+      cli.yellow("  Mode: --all (no Cloudflare filter, probe every subnet)")
+    );
   }
-
-  const matcher = new CloudflareRangeMatcher(cfRanges);
-  console.log(
-    cli.green(`  Loaded ${matcher.count} official Cloudflare ranges`)
-  );
+  if (!PROBE_CONFIG.isTraceEndpoint) {
+    console.log(cli.cyan(`  Probe URL:  ${probeUrl} (any HTTP response)`));
+  }
   console.log("");
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 2: Stream through subnets file and filter Cloudflare matches
-  // ─────────────────────────────────────────────────────────────────────────
-  console.log(cli.cyan("  [2/4] Scanning file for Cloudflare subnets..."));
+  let uniqueSubnets: string[];
 
-  const startFilter = Date.now();
-  const cloudflareSubnets = await streamSubnets(
-    inputFile,
-    matcher,
-    (processed, found) => {
-      const bar = progressBar(processed, 335325);
-      process.stdout.write(
-        `\r  ${bar} ${processed.toLocaleString()} processed, ${cli.green(
-          found.toString()
-        )} CF matches    `
-      );
+  if (all) {
+    // ─────────────────────────────────────────────────────────────────────
+    // --all: Load ALL subnets, no Cloudflare filter
+    // ─────────────────────────────────────────────────────────────────────
+    console.log(cli.cyan("  [1/2] Loading subnets (no filter)..."));
+
+    const startLoad = Date.now();
+    uniqueSubnets = await streamAllSubnets(inputFile, (processed) => {
+      if (processed % 10000 === 0) {
+        process.stdout.write(`\r  ${processed.toLocaleString()} lines...`);
+      }
+    });
+    process.stdout.write("\r" + " ".repeat(40) + "\r");
+
+    uniqueSubnets = [...new Set(uniqueSubnets)];
+    const loadTime = ((Date.now() - startLoad) / 1000).toFixed(1);
+    console.log(
+      cli.green(
+        `  Loaded ${uniqueSubnets.length.toLocaleString()} subnets in ${loadTime}s`
+      )
+    );
+    console.log("");
+  } else {
+    // ─────────────────────────────────────────────────────────────────────
+    // Default: Fetch Cloudflare ranges and filter
+    // ─────────────────────────────────────────────────────────────────────
+    console.log(cli.cyan("  [1/4] Fetching official Cloudflare IP ranges..."));
+
+    let cfRanges: string[];
+    try {
+      const [v4Res, v6Res] = await Promise.all([
+        fetch(CONFIG.CF_IPV4_URL, { signal: AbortSignal.timeout(15000) }),
+        fetch(CONFIG.CF_IPV6_URL, { signal: AbortSignal.timeout(15000) }),
+      ]);
+
+      const v4Text = await v4Res.text();
+      const v6Text = await v6Res.text();
+
+      cfRanges = [
+        ...v4Text.split(/\r?\n/).filter((s) => s.trim() && !s.startsWith("#")),
+        ...v6Text.split(/\r?\n/).filter((s) => s.trim() && !s.startsWith("#")),
+      ];
+    } catch {
+      console.log(cli.yellow("  Failed to fetch, using built-in ranges..."));
+      cfRanges = [
+        "173.245.48.0/20",
+        "103.21.244.0/22",
+        "103.22.200.0/22",
+        "103.31.4.0/22",
+        "141.101.64.0/18",
+        "108.162.192.0/18",
+        "190.93.240.0/20",
+        "188.114.96.0/20",
+        "197.234.240.0/22",
+        "198.41.128.0/17",
+        "162.158.0.0/15",
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+        "172.64.0.0/13",
+        "131.0.72.0/22",
+      ];
     }
-  );
-  process.stdout.write("\r" + " ".repeat(80) + "\r");
 
-  const filterTime = ((Date.now() - startFilter) / 1000).toFixed(1);
-  console.log(
-    cli.green(
-      `  Found ${cloudflareSubnets.length.toLocaleString()} Cloudflare subnets in ${filterTime}s`
-    )
-  );
+    const matcher = new CloudflareRangeMatcher(cfRanges);
+    console.log(
+      cli.green(`  Loaded ${matcher.count} official Cloudflare ranges`)
+    );
+    console.log("");
 
-  if (cloudflareSubnets.length === 0) {
-    console.log(cli.yellow("  No Cloudflare subnets found in the input file."));
-    process.exit(1);
+    console.log(cli.cyan("  [2/4] Scanning file for Cloudflare subnets..."));
+
+    const startFilter = Date.now();
+    const cloudflareSubnets = await streamSubnets(
+      inputFile,
+      matcher,
+      (processed, found) => {
+        const bar = progressBar(processed, 335325);
+        process.stdout.write(
+          `\r  ${bar} ${processed.toLocaleString()} processed, ${cli.green(
+            found.toString()
+          )} CF matches    `
+        );
+      }
+    );
+    process.stdout.write("\r" + " ".repeat(80) + "\r");
+
+    const filterTime = ((Date.now() - startFilter) / 1000).toFixed(1);
+    console.log(
+      cli.green(
+        `  Found ${cloudflareSubnets.length.toLocaleString()} Cloudflare subnets in ${filterTime}s`
+      )
+    );
+
+    if (cloudflareSubnets.length === 0) {
+      console.log(
+        cli.yellow(
+          "  No Cloudflare subnets found. Try --all to probe every subnet."
+        )
+      );
+      process.exit(1);
+    }
+
+    fs.writeFileSync(
+      CONFIG.CLOUDFLARE_OUTPUT,
+      [
+        "# Cloudflare subnets extracted from " + inputFile,
+        "# " + new Date().toISOString().slice(0, 10),
+        "# " + cloudflareSubnets.length + " subnets",
+        "",
+        ...cloudflareSubnets,
+      ].join("\n") + "\n"
+    );
+    console.log(cli.dim(`  Saved to ${CONFIG.CLOUDFLARE_OUTPUT}`));
+    console.log("");
+
+    console.log(cli.cyan("  [3/4] Optimizing scan list..."));
+    uniqueSubnets = [...new Set(cloudflareSubnets)];
   }
 
-  // Save filtered Cloudflare subnets
-  fs.writeFileSync(
-    CONFIG.CLOUDFLARE_OUTPUT,
-    [
-      "# Cloudflare subnets extracted from " + inputFile,
-      "# " + new Date().toISOString().slice(0, 10),
-      "# " + cloudflareSubnets.length + " subnets",
-      "",
-      ...cloudflareSubnets,
-    ].join("\n") + "\n"
-  );
-  console.log(cli.dim(`  Saved to ${CONFIG.CLOUDFLARE_OUTPUT}`));
-  console.log("");
-
   // ─────────────────────────────────────────────────────────────────────────
-  // STEP 3: Deduplicate and optimize scan list
+  // Deduplicate done; verbose test and scan
   // ─────────────────────────────────────────────────────────────────────────
-  console.log(cli.cyan("  [3/4] Optimizing scan list..."));
 
-  // Remove duplicates
-  const uniqueSubnets = [...new Set(cloudflareSubnets)];
+  // Verbose: test first IP and show response
+  if (verbose && uniqueSubnets.length > 0) {
+    const testIp = getRandomIps(uniqueSubnets[0], 1)[0];
+    console.log(cli.cyan(`  [verbose] Testing ${testIp} → ${probeUrl}`));
+    const { ok, raw } = await probeWithRawResponse(testIp, PROBE_CONFIG);
+    console.log(cli.dim("  Response:"));
+    console.log(
+      cli.dim(raw.slice(0, 600) + (raw.length > 600 ? "\n  ..." : ""))
+    );
+    console.log(
+      cli[ok ? "green" : "yellow"](`  Result: ${ok ? "OK" : "FAILED"}`)
+    );
+    console.log("");
+  }
   console.log(cli.dim(`  ${uniqueSubnets.length} unique subnets to scan`));
   console.log("");
 
   // ─────────────────────────────────────────────────────────────────────────
-  // STEP 4: Scan for clean IPs with high concurrency
+  // Scan for clean IPs with high concurrency
   // ─────────────────────────────────────────────────────────────────────────
+  const scanStep = all ? "[2/2]" : "[4/4]";
   console.log(
     cli.cyan(
-      `  [4/4] Scanning ${uniqueSubnets.length} subnets (${CONFIG.CONCURRENCY} concurrent)...`
+      `  ${scanStep} Scanning ${uniqueSubnets.length} subnets (${CONFIG.CONCURRENCY} concurrent)...`
     )
   );
+
+  // Init output files (append each clean subnet as found)
+  const header =
+    "# Clean Cloudflare IP subnets (saved as found)\n" +
+    "# " +
+    new Date().toISOString().slice(0, 10) +
+    "\n\n# Format: subnet | avg_latency_ms | success_rate\n";
+  fs.writeFileSync(CONFIG.OUTPUT_FILE, header);
+  fs.writeFileSync("clean-ips-plain.txt", "");
 
   const startScan = Date.now();
   let passedCount = 0;
@@ -587,6 +851,14 @@ async function main(): Promise<void> {
           passedCount.toString()
         )} clean    `
       );
+    },
+    (result) => {
+      // Append immediately when subnet passes
+      const line = `${result.cidr.padEnd(20)} # ${result.avgLatency
+        .toFixed(0)
+        .padStart(4)}ms  ${(result.successRate * 100).toFixed(0)}%\n`;
+      fs.appendFileSync(CONFIG.OUTPUT_FILE, line);
+      fs.appendFileSync("clean-ips-plain.txt", result.cidr + "\n");
     }
   );
 
@@ -611,30 +883,26 @@ async function main(): Promise<void> {
     console.log(
       cli.yellow("  Your network may be blocking Cloudflare traffic.")
     );
-    process.exit(1);
+    fs.writeFileSync(
+      CONFIG.OUTPUT_FILE,
+      "# No clean subnets found\n# " +
+        new Date().toISOString().slice(0, 10) +
+        "\n\n"
+    );
+    fs.writeFileSync("clean-ips-plain.txt", "");
+    console.log(cli.dim("  ✓ Empty output written"));
+    return;
   }
 
-  // Save clean IPs sorted by latency
-  const output =
-    [
-      "# Clean Cloudflare IP subnets (sorted by latency, best first)",
-      "# " + new Date().toISOString().slice(0, 10),
-      "# " + cleanResults.length + " subnets",
-      "",
-      "# Format: subnet | avg_latency_ms | success_rate",
-      ...cleanResults.map(
-        (r) =>
-          `${r.cidr.padEnd(20)} # ${r.avgLatency.toFixed(0).padStart(4)}ms  ${(
-            r.successRate * 100
-          ).toFixed(0)}%`
-      ),
-    ].join("\n") + "\n";
-
-  fs.writeFileSync(CONFIG.OUTPUT_FILE, output);
-
-  // Also save just the IPs without metadata
-  const plainOutput = cleanResults.map((r) => r.cidr).join("\n") + "\n";
-  fs.writeFileSync("clean-ips-plain.txt", plainOutput);
+  // Update header with count (files already appended during scan)
+  const content = fs.readFileSync(CONFIG.OUTPUT_FILE, "utf-8");
+  fs.writeFileSync(
+    CONFIG.OUTPUT_FILE,
+    content.replace(
+      "# Clean Cloudflare IP subnets (saved as found)",
+      `# Clean Cloudflare IP subnets (saved as found)\n# ${cleanResults.length} subnets`
+    )
+  );
 
   console.log(
     cli.green(

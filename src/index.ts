@@ -14,10 +14,26 @@ import { cli } from "./utils";
 
 const OUTPUT_FILE = "ip.txt";
 
+function getProbeUrl(): string {
+  const args = process.argv.slice(2);
+  const idx = args.findIndex((a) => a === "--probe-url" || a === "-u");
+  return idx >= 0 && args[idx + 1]
+    ? args[idx + 1]
+    : process.env.PROBE_URL || "https://biatid.ir/pull/";
+}
+
 async function main(): Promise<void> {
+  const probeUrl = getProbeUrl();
+
   console.log("");
   console.log(cli.bold("  Cloudflare Clean IP Scanner"));
-  console.log(cli.dim("  Fetch → Probe ranges (HTTPS trace verification)"));
+  console.log(
+    cli.dim(
+      probeUrl.includes("cloudflare.com/cdn-cgi/trace")
+        ? "  Fetch → Probe ranges (HTTPS trace verification)"
+        : `  Fetch → Probe ranges (${probeUrl})`
+    )
+  );
   console.log("");
 
   // 1. Fetch Cloudflare IP ranges
@@ -27,14 +43,17 @@ async function main(): Promise<void> {
   console.log(cli.green(`  Fetched ${ranges.length} ranges`));
   console.log("");
 
-  // 2. Probe ranges with a TCP connect on port 443.
-  //    probeRanges tries a few IPs from each range (better than only start IP)
-  //    and marks the range as working if any of them connect successfully.
-  console.log(cli.cyan("  Probing ranges (HTTPS trace verification)..."));
-  const goodRanges = await probeRanges(ranges, 443, (cur, tot, cidr, ok) => {
-    const status = ok ? cli.green("✓") : cli.dim("✗");
-    process.stdout.write(`\r  ${cur}/${tot} ${status} ${cidr}    `);
-  });
+  // 2. Probe ranges - connect to each IP, request URL (like curl --resolve)
+  console.log(cli.cyan("  Probing ranges..."));
+  const goodRanges = await probeRanges(
+    ranges,
+    443,
+    (cur, tot, cidr, ok) => {
+      const status = ok ? cli.green("✓") : cli.dim("✗");
+      process.stdout.write(`\r  ${cur}/${tot} ${status} ${cidr}    `);
+    },
+    probeUrl
+  );
   process.stdout.write("\r" + " ".repeat(70) + "\r");
 
   console.log(

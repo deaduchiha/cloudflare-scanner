@@ -35,24 +35,50 @@ node dist/index.js
 
 Use when you have a large file of subnets (e.g. 300k+ lines) and want to:
 
-1. Filter to only subnets **contained within** Cloudflare ranges
+1. Filter to only subnets that **overlap** Cloudflare ranges
 2. Probe those for working IPs
 
 ```bash
 npm run scan:subnets
 # or specify a file:
 node dist/scan-subnets.js path/to/subnets.txt
+
+# Probe ALL subnets (no Cloudflare filter) — when your list already has CF subnets:
+node dist/scan-subnets.js subnets.txt --all
 ```
 
 **Input:** `subnets.txt` (default) or any file path you pass.
 
+**`--all` / `-a`:** Skip the Cloudflare overlap filter. Probes every subnet in the file. Use when your subnets include Cloudflare IPs not in the official list, or use non-standard formats (e.g. `L1:192.168.0.0/24`).
+
 **Output:**
 
-- `cloudflare-subnets.txt` — subnets that are fully within Cloudflare ranges (before probing)
+- `cloudflare-subnets.txt` — subnets that overlap Cloudflare ranges (before probing)
 - `clean-ips.txt` — working subnets with latency and success rate
 - `clean-ips-plain.txt` — plain list of working subnets only
 
-**Filter logic:** Only subnets **fully contained** within official Cloudflare ranges are kept. Catch-all subnets like `0.0.0.0/0` are excluded.
+**Filter logic:** Subnets that **overlap** Cloudflare ranges are kept. Catch-all subnets like `0.0.0.0/0` are excluded.
+
+---
+
+### Custom Probe URL — Test Your Own Site
+
+Probe your own website (behind Cloudflare) instead of cloudflare.com. Works like `curl --resolve HOST:443:IP`.
+
+```bash
+# Environment variable
+PROBE_URL=https://yoursite.com/ node dist/scan-subnets.js subnets.txt
+
+# Or CLI flag (both modes)
+node dist/scan-subnets.js subnets.txt --probe-url https://yoursite.com/
+node dist/index.js --probe-url https://yoursite.com/
+```
+
+- **Default:** `https://biatid.ir/pull/` — verifies HTTP 2xx response
+- **Cloudflare trace:** `https://www.cloudflare.com/cdn-cgi/trace` — verifies `colo=`, `ip=`
+- **Custom URL:** Any HTTPS URL — verifies HTTP 2xx response
+
+Use this to find Cloudflare IPs that can reach **your** site (e.g. in restricted networks).
 
 ---
 

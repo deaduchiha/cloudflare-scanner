@@ -1,14 +1,9 @@
 /**
  * Probe Cloudflare IP ranges using HTTP trace verification.
  *
- * NEW ALGORITHM:
- * - For each range, pick random IPs spread across the range
- * - Make HTTPS request to /cdn-cgi/trace (Cloudflare's trace endpoint)
- * - Verify response contains "colo=" (Cloudflare datacenter code)
- * - A range is clean only if majority of IPs return valid Cloudflare response
- *
- * This is more accurate than TCP-only because it verifies actual Cloudflare service,
- * not just that port 443 is open.
+ * Supports custom PROBE_URL: test your own site behind Cloudflare.
+ * Default: https://www.cloudflare.com/cdn-cgi/trace (checks colo=/ip=)
+ * Custom: any URL (checks HTTP 2xx) - like curl --resolve HOST:443:IP
  */
 
 import * as net from "net";
@@ -19,6 +14,36 @@ const TIMEOUT_MS = 5000;
 const SAMPLES_PER_RANGE = 5;
 const MIN_SUCCESS_RATE = 0.6; // 60% must pass
 const MAX_AVG_LATENCY = 2000; // ms
+
+const DEFAULT_PROBE_URL = "https://biatid.ir/pull/";
+
+interface ProbeConfig {
+  host: string;
+  path: string;
+  port: number;
+  isTraceEndpoint: boolean;
+}
+
+function parseProbeUrl(url: string): ProbeConfig {
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+  }
+  const u = new URL(url);
+  const port = u.port
+    ? parseInt(u.port, 10)
+    : u.protocol === "https:"
+    ? 443
+    : 80;
+  const path = u.pathname || "/";
+  const isTraceEndpoint =
+    u.hostname === "www.cloudflare.com" && path.includes("/cdn-cgi/trace");
+  return {
+    host: u.hostname,
+    path: path + (u.search || ""),
+    port,
+    isTraceEndpoint,
+  };
+}
 
 /** Get random IPs spread across a CIDR range. */
 function getRandomIps(cidr: string, count: number): string[] {
@@ -70,79 +95,90 @@ function getRandomIps(cidr: string, count: number): string[] {
   }
 }
 
-/**
- * Check if an IP returns valid Cloudflare trace response.
- * Makes HTTPS request to /cdn-cgi/trace and verifies "colo=" in response.
- */
-function checkCloudflareTrace(
-  ip: string
+function checkProbe(
+  ip: string,
+  probe: ProbeConfig
 ): Promise<{ ok: boolean; latencyMs: number }> {
   return new Promise((resolve) => {
     const start = Date.now();
     let resolved = false;
+    const data = { buf: "" };
 
     const done = (ok: boolean) => {
       if (resolved) return;
       resolved = true;
-      const latencyMs = Date.now() - start;
-      resolve({ ok, latencyMs });
+      resolve({ ok, latencyMs: Date.now() - start });
     };
 
-    const timeout = setTimeout(() => {
-      done(false);
-    }, TIMEOUT_MS);
+    const timeout = setTimeout(() => done(false), TIMEOUT_MS);
 
-    // Create raw TCP connection to the IP
-    const socket = net.connect(443, ip, () => {
-      // Upgrade to TLS with cloudflare.com as SNI
-      const tlsSocket = tls.connect(
-        {
-          socket,
-          servername: "www.cloudflare.com",
-          rejectUnauthorized: false, // Allow self-signed for testing
-        },
-        () => {
-          // Send HTTP request
-          const request = [
-            "GET /cdn-cgi/trace HTTP/1.1",
-            "Host: www.cloudflare.com",
-            "Connection: close",
-            "User-Agent: Mozilla/5.0",
-            "",
-            "",
-          ].join("\r\n");
+    const runRequest = (sock: net.Socket | tls.TLSSocket) => {
+      const request = [
+        `GET ${probe.path} HTTP/1.1`,
+        `Host: ${probe.host}`,
+        "Connection: close",
+        "User-Agent: Mozilla/5.0",
+        "",
+        "",
+      ].join("\r\n");
+      sock.write(request);
 
-          tlsSocket.write(request);
-
-          let data = "";
-          tlsSocket.on("data", (chunk) => {
-            data += chunk.toString();
-            // Check if we got what we need
-            if (data.includes("colo=") && data.includes("ip=")) {
-              clearTimeout(timeout);
-              tlsSocket.destroy();
-              done(true);
-            }
-          });
-
-          tlsSocket.on("end", () => {
+      sock.on("data", (chunk) => {
+        data.buf += chunk.toString();
+        if (probe.isTraceEndpoint) {
+          if (data.buf.includes("colo=") && data.buf.includes("ip=")) {
             clearTimeout(timeout);
-            // Final check
-            const hasTrace = data.includes("colo=") && data.includes("ip=");
-            done(hasTrace);
-          });
-
-          tlsSocket.on("error", () => {
+            sock.destroy();
+            done(true);
+          }
+        } else {
+          const match = data.buf.match(/HTTP\/\d\.\d\s+(\d{3})/);
+          if (match) {
+            const code = parseInt(match[1], 10);
             clearTimeout(timeout);
-            done(false);
-          });
+            sock.destroy();
+            done(code >= 100 && code < 600);
+          }
         }
-      );
+      });
 
-      tlsSocket.on("error", () => {
+      sock.on("end", () => {
+        clearTimeout(timeout);
+        if (probe.isTraceEndpoint) {
+          done(data.buf.includes("colo=") && data.buf.includes("ip="));
+        } else {
+          const match = data.buf.match(/HTTP\/\d\.\d\s+(\d{3})/);
+          done(
+            match
+              ? parseInt(match[1], 10) >= 100 && parseInt(match[1], 10) < 600
+              : false
+          );
+        }
+      });
+
+      sock.on("error", () => {
         clearTimeout(timeout);
         done(false);
       });
+    };
+
+    const socket = net.connect(probe.port, ip, () => {
+      if (probe.port === 443) {
+        const tlsSocket = tls.connect(
+          {
+            socket,
+            servername: probe.host,
+            rejectUnauthorized: false,
+          },
+          () => runRequest(tlsSocket)
+        );
+        tlsSocket.on("error", () => {
+          clearTimeout(timeout);
+          done(false);
+        });
+      } else {
+        runRequest(socket);
+      }
     });
 
     socket.on("error", () => {
@@ -167,13 +203,16 @@ interface RangeResult {
 }
 
 /** Probe a single range by testing multiple random IPs. */
-async function probeRange(cidr: string): Promise<RangeResult> {
+async function probeRange(
+  cidr: string,
+  probe: ProbeConfig
+): Promise<RangeResult> {
   const ips = getRandomIps(cidr, SAMPLES_PER_RANGE);
   if (ips.length === 0) {
     return { cidr, successRate: 0, avgLatency: 0, passed: false };
   }
 
-  const results = await Promise.all(ips.map((ip) => checkCloudflareTrace(ip)));
+  const results = await Promise.all(ips.map((ip) => checkProbe(ip, probe)));
   const successes = results.filter((r) => r.ok);
   const successRate = successes.length / results.length;
 
@@ -199,8 +238,13 @@ export async function probeRanges(
     total: number,
     cidr: string,
     ok: boolean
-  ) => void
+  ) => void,
+  probeUrl?: string
 ): Promise<string[]> {
+  const probe = parseProbeUrl(
+    probeUrl || process.env.PROBE_URL || DEFAULT_PROBE_URL
+  );
+
   const valid = cidrs.filter((c) => {
     const t = c.trim();
     return t && !t.startsWith("#");
@@ -217,7 +261,7 @@ export async function probeRanges(
     while (index < valid.length) {
       const i = index++;
       const cidr = valid[i];
-      const result = await probeRange(cidr);
+      const result = await probeRange(cidr, probe);
       results.push(result);
       done++;
       onProgress?.(done, valid.length, cidr, result.passed);
