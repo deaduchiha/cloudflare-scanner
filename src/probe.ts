@@ -6,17 +6,33 @@
 import * as net from "net";
 import IpCidr from "ip-cidr";
 
-const PROBE_TIMEOUT_MS = 4000;
+const PROBE_TIMEOUT_MS = 3000;
 const PROBE_PORT = 443;
 
-/** Get first IP from a CIDR range for probing. */
-function getProbeIp(cidr: string): string | null {
+/** Get IPs to probe from a CIDR - try multiple as .0 often doesn't respond. */
+function getProbeIps(cidr: string): string[] {
   try {
     const c = new IpCidr(cidr.trim());
     const start = c.start() as string;
-    return start || null;
+    if (!start) return [];
+    const ips: string[] = [start];
+    if (start.includes(".")) {
+      const parts = start.split(".").map(Number);
+      if (parts.length === 4) {
+        if (parts[3] === 0) ips.push(`${parts[0]}.${parts[1]}.${parts[2]}.1`);
+        ips.push(`${parts[0]}.${parts[1]}.${parts[2]}.${Math.min(255, parts[3] + 1)}`);
+      }
+    } else {
+      try {
+        const arr = c.toArray({ from: 1, limit: 1 });
+        if (Array.isArray(arr) && arr[0]) ips.push(arr[0]);
+      } catch {
+        /* ignore */
+      }
+    }
+    return [...new Set(ips)].slice(0, 3);
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -53,9 +69,14 @@ export async function probeRanges(
   let done = 0;
 
   const probeOne = async (cidr: string): Promise<boolean> => {
-    const ip = getProbeIp(cidr);
-    if (!ip) return false;
-    const ok = await probeIp(ip, port);
+    const ips = getProbeIps(cidr);
+    if (ips.length === 0) {
+      done++;
+      onProgress?.(done, valid.length, cidr, false);
+      return false;
+    }
+    const results = await Promise.all(ips.map((ip) => probeIp(ip, port)));
+    const ok = results.some((r) => r);
     done++;
     onProgress?.(done, valid.length, cidr, ok);
     return ok;
