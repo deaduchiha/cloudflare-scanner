@@ -78,6 +78,12 @@ function cidrToRange(cidr: string): { start: number; end: number } | null {
   }
 }
 
+/** Exclude catch-all subnets that overlap everything (0.0.0.0/0, ::/0) */
+function isCatchAllSubnet(cidr: string): boolean {
+  const trimmed = cidr.trim();
+  return trimmed === "0.0.0.0/0" || trimmed === "::/0";
+}
+
 /** Check if two ranges overlap */
 function rangesOverlap(
   a: { start: number; end: number },
@@ -226,9 +232,9 @@ async function streamSubnets(
         return;
       }
 
-      // Check if this subnet is fully contained within Cloudflare ranges
-      // (stricter than overlap - excludes 0.0.0.0/0 and partial overlaps)
-      if (matcher.containedInCloudflare(trimmed)) {
+      // Check if this subnet overlaps with Cloudflare ranges (includes partial overlaps)
+      // Exclude 0.0.0.0/0 explicitly - it overlaps everything but is meaningless to scan
+      if (matcher.overlapsCloudflare(trimmed) && !isCatchAllSubnet(trimmed)) {
         cloudflareSubnets.push(trimmed);
       }
 
