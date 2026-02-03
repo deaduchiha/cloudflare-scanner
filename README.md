@@ -20,13 +20,18 @@ node dist/index.js
 ## What it does
 
 1. **Fetch** — Downloads Cloudflare IPv4 and IPv6 ranges from cloudflare.com/ips-v4 and /ips-v6
-2. **Probe ranges** — For each CIDR, tests a few sample IPs with:
-   - TCP connect to port 443
-   - If any sample IP in the range connects (no timeout), the whole range is marked as working.
-3. **Output** — Writes only the **working ranges** (not individual IPs) to `ip.txt`
+2. **Probe ranges** — For each CIDR:
+   - Picks **random IPs** spread across the range (not just start/end)
+   - Makes **HTTPS request** to Cloudflare's `/cdn-cgi/trace` endpoint
+   - Verifies response contains `colo=` and `ip=` (proves it's real Cloudflare)
+   - Measures latency for each successful response
+3. **Filter** — A range passes only if:
+   - **≥60%** of sampled IPs return valid Cloudflare trace
+   - **Average latency** is under 2 seconds
+4. **Output** — Writes only the **working ranges** (sorted by latency, best first) to `ip.txt`
 
-This method is designed for networks like **Iran**, where many Cloudflare IPs are blocked or throttled.  
-If a range times out on TCP 443, it is excluded.
+This method is designed for networks like **Iran**, where many Cloudflare IPs are blocked or return fake responses.  
+Unlike TCP-only checks, this verifies the IP actually serves real Cloudflare content.
 
 ## Output
 

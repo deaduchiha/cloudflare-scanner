@@ -17,7 +17,7 @@ const OUTPUT_FILE = "ip.txt";
 async function main(): Promise<void> {
   console.log("");
   console.log(cli.bold("  Cloudflare Clean IP Scanner"));
-  console.log(cli.dim("  Fetch → Probe ranges (TCP 443)"));
+  console.log(cli.dim("  Fetch → Probe ranges (HTTPS trace verification)"));
   console.log("");
 
   // 1. Fetch Cloudflare IP ranges
@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   // 2. Probe ranges with a TCP connect on port 443.
   //    probeRanges tries a few IPs from each range (better than only start IP)
   //    and marks the range as working if any of them connect successfully.
-  console.log(cli.cyan("  Probing ranges (port 443 TCP, no timeout)..."));
+  console.log(cli.cyan("  Probing ranges (HTTPS trace verification)..."));
   const goodRanges = await probeRanges(ranges, 443, (cur, tot, cidr, ok) => {
     const status = ok ? cli.green("✓") : cli.dim("✗");
     process.stdout.write(`\r  ${cur}/${tot} ${status} ${cidr}    `);
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
   // 3. Write output: only ranges, no individual IPs
   const content =
     [
-      "# Working Cloudflare IP ranges (TCP 443 reachable on your network)",
+      "# Working Cloudflare IP ranges (HTTPS trace verified, sorted by latency)",
       "# " + new Date().toISOString().slice(0, 10),
       "# " + goodRanges.length + " ranges",
       "",
